@@ -1,0 +1,7 @@
+**/__pycache__/**
+outputs/**
+checkpoint/**
+**/*.egg-info/**
+**/*.swp
+**/*.pt
+**/*.json
