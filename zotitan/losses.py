@@ -1,7 +1,7 @@
 from functools import lru_cache
 import torch
 
-from schedule import maybe_torchcompile
+from .schedule import maybe_torchcompile
 
 
 def get_xentropy(fused: bool, compile_mode: str | None = None):

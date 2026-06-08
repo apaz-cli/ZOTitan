@@ -3,8 +3,8 @@ import json
 import random
 import torch
 
-from data import EVAL_SAMPLES, batched
-from objective import (CrossEntropyCriterion, DatasetSource, RubricObjective, register_objective)
+from ..data import EVAL_SAMPLES, batched
+from ..objective import (CrossEntropyCriterion, DatasetSource, RubricObjective, register_objective)
 
 
 @register_objective("scijudge")

@@ -17,8 +17,8 @@ import random
 import re
 import torch
 
-from data import EVAL_SAMPLES
-from objective import DatasetSource, Score, register_objective
+from ..data import EVAL_SAMPLES
+from ..objective import DatasetSource, Score, register_objective
 
 # ── verifier reward ───────────────────────────────────────────────────────────────
 # Ported from es-fine-tuning-paper/countdown/countdown_task.py. `response` is the model's

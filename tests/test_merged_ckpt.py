@@ -4,14 +4,12 @@ The merged checkpoint, loaded as a plain HF model, must reproduce the wrapped
 model's logits (the merge is mathematically what LoRALinear.forward computes).
 Run on GPU 1: CUDA_VISIBLE_DEVICES=1 .venv/bin/python tests/test_merged_ckpt.py
 """
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile
 import torch
 from transformers import AutoModelForCausalLM
 
-from model import load_model, ModelConfig
-from lora import make_lora, LoRAConfig, merged_state_dict
+from zotitan.model import load_model, ModelConfig
+from zotitan.lora import make_lora, LoRAConfig, merged_state_dict
 
 
 def main():

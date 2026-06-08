@@ -15,5 +15,5 @@ dependencies = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
-[tool.setuptools]
-packages = []
+[tool.setuptools.packages.find]
+include = ["zotitan*"]

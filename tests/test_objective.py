@@ -2,16 +2,15 @@
 
 Uses fake atomic objectives so no model/GPU/dataset is needed (the model path is
 covered by tests/test_smoke.py)."""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from collections import Counter
 from typing import Any
 
 import pytest
 
-from objective import (
+from zotitan.objective import (
     Score, ObjectiveMixture, MixtureComponent, make_objective,
     parse_objective_spec, build_objective, register_objective, OBJECTIVES,
+    DatasetSource,
 )
 
 
@@ -92,7 +91,6 @@ def test_mixture_differentiable_propagates():
 
 
 def test_mixture_collects_all_dataset_sources():
-    from objective import DatasetSource
     noop = lambda: None
     sa = DatasetSource("a", lambda: True, noop)
     sb = DatasetSource("b", lambda: True, noop)

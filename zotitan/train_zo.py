@@ -8,12 +8,12 @@ import triton
 import triton.language as tl
 from dataclasses import dataclass, field
 from typing import Literal
-from data import PrefetchLoader, get_batches
-from pretty import print_config, print_zo_step
-import profiling
-from profiling import ProfilingConfig, maybe_enable_profiling
-from schedule import wsd_value, wsd_is_constant, BaseTrainConfig, maybe_torchcompile
-from lora import save_merged_checkpoint
+from .data import PrefetchLoader, get_batches
+from .pretty import print_config, print_zo_step
+from . import profiling
+from .profiling import ProfilingConfig, maybe_enable_profiling
+from .schedule import wsd_value, wsd_is_constant, BaseTrainConfig, maybe_torchcompile
+from .lora import save_merged_checkpoint
 
 
 @triton.jit

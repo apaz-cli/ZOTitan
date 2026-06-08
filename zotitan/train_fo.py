@@ -4,12 +4,12 @@ import torch
 from dataclasses import dataclass, field
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from lora import save_merged_checkpoint
-from objective import floatify
-from pretty import print_config, print_fo_step
-import profiling
-from profiling import ProfilingConfig, maybe_enable_profiling
-from schedule import WSDConfig, wsd_value, wsd_is_constant, BaseTrainConfig
+from .lora import save_merged_checkpoint
+from .objective import floatify
+from .pretty import print_config, print_fo_step
+from . import profiling
+from .profiling import ProfilingConfig, maybe_enable_profiling
+from .schedule import WSDConfig, wsd_value, wsd_is_constant, BaseTrainConfig
 
 
 @dataclass

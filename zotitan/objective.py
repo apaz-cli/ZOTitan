@@ -76,7 +76,7 @@ class CrossEntropyCriterion:
 
     def __init__(self, compile_enabled: bool = False, compile_mode: str | None = None,
                  z_loss_weight: float = 0.0, fused: bool = True, compute_accuracy: bool = True):
-        from losses import get_xentropy
+        from .losses import get_xentropy
         self.compile_enabled  = compile_enabled
         self.compile_mode     = compile_mode
         self.z_loss_weight    = z_loss_weight
@@ -324,7 +324,7 @@ def make_objective(dataset: str, compile_enabled: bool = False, compile_mode: st
     if cls is None:
         raise ValueError(f"Unknown objective {dataset!r}; registered: {sorted(OBJECTIVES)}")
     if max_seq_len is None:
-        from model import ModelConfig
+        from .model import ModelConfig
         max_seq_len = ModelConfig().max_seq_len
     return cls(compile_enabled, compile_mode, max_seq_len, **kwargs)
 
@@ -479,4 +479,4 @@ def build_objective(objs: list[ObjectiveConfig], compile_enabled: bool = False,
 # very bottom — those modules import names defined above (register_objective,
 # _RubricObjective, CrossEntropyCriterion, DatasetSource), so everything they need exists
 # by the time this runs.
-import objectives  # noqa: E402,F401
+from . import objectives  # noqa: E402,F401

@@ -2,11 +2,11 @@
 import pytest
 from mlsweep.logger import MLSweepLogger
 
-from train import ExperimentConfig, TrainingConfig, run
-from train_fo import FOConfig
-from train_zo import ZOConfig
-from lora import LoRAConfig
-from schedule import BaseTrainConfig
+from zotitan.train import ExperimentConfig, TrainingConfig, run
+from zotitan.train_fo import FOConfig
+from zotitan.train_zo import ZOConfig
+from zotitan.lora import LoRAConfig
+from zotitan.schedule import BaseTrainConfig
 
 # Parameterize so it will be fast to launch by disabling torchcompile
 
