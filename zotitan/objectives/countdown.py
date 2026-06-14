@@ -60,20 +60,16 @@ def _reward(response: str, nums: list[int], target: int) -> tuple[float, float, 
     return 0.1 * fmt + ans, ans, fmt
 
 
-MAX_REWARD = 0.1 + 1.0   # perfect format + answer; the loss floor
+MAX_REWARD = 0.1 + 1.0
 
-
-# ── prompt ────────────────────────────────────────────────────────────────────────
-# The TinyZero scaffold; ends mid-turn at "<think>" so the model continues straight into
-# its reasoning. nums render as "[44 19 35]" (space-separated).
 _PROMPT = (
     "You are a helpful assistant. You first think about the reasoning process in your "
     "mind and then provide the user with the answer."
     "Using the numbers {nums}, create an equation that equals {target}. You can use "
     "basic arithmetic operations (+, -, *, /) and each number can only be used once. "
-    "Show your work in <think> </think> tags. And return the final answer in <answer> "
+    "Show your work in <think> </think> tags, and return the final answer in <answer> "
     "</answer> tags, for example <answer> (1 + 2) / 3 </answer>."
-    "Let me solve this step by step.\n<think>"
+    "Let's solve this step by step.\n<think>"
 )
 
 

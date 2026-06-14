@@ -1,5 +1,6 @@
 """ANSI colour helpers for training output."""
 import dataclasses
+import sys
 
 BOLD  = "\033[1m"
 DIM   = "\033[2m"
@@ -10,6 +11,38 @@ YEL   = "\033[33m"
 MAG   = "\033[35m"
 BLUE  = "\033[34m"
 RED   = "\033[31m"
+
+
+_BANNER_ART = r"""
+ ________   _____    ______        __
+/\_____  \ /\  __`\ /\__  _\  __  /\ \__
+\/____//'/'\ \ \/\ \\/_/\ \/ /\_\ \ \ ,_\     __       ___
+     //'/'  \ \ \ \ \  \ \ \ \/\ \ \ \ \/   /'__`\   /' _ `\
+    //'/'__  \ \ \_\ \  \ \ \ \ \ \ \ \ \_ /\ \L\.\_ /\ \/\ \
+    /\_______\\ \_____\  \ \_\ \ \_\ \ \__\\ \__/.\_\\ \_\ \_\
+    \/_______/ \/_____/   \/_/  \/_/  \/__/ \/__/\/_/ \/_/\/_/
+      A Training Codebase for Evolutionary Strategies
+"""
+
+# bright green for the figlet, bright blue for the tagline prose.
+_BGREEN, _BBLUE = "\033[92m", "\033[94m"
+_TAGLINE = "A Training Codebase for Evolutionary Strategies"
+
+
+def _colorize_banner(art: str) -> str:
+    """Bright-green the art; recolor the tagline prose bright blue."""
+    lines = []
+    for line in art.split("\n"):
+        if _TAGLINE in line:
+            start = line.index(_TAGLINE)
+            end = start + len(_TAGLINE)
+            line = f"{line[:start]}{_BBLUE}{_TAGLINE}{_BGREEN}{line[end:]}"
+        lines.append(line)
+    return f"{_BGREEN}{chr(10).join(lines)}{RESET}"
+
+
+# Color only when writing to a terminal; piped/redirected --help stays plain.
+BANNER = _colorize_banner(_BANNER_ART) if sys.stdout.isatty() else _BANNER_ART
 
 
 def fmt_config(cfg, indent: int = 0) -> str:

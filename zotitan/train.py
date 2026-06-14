@@ -13,7 +13,36 @@ from .train_fo import train_fo, FOConfig
 from .train_zo import train_zo, ZOConfig
 from .objective import build_objective, parse_objective_spec, prepare_datasets
 from .profiling import ProfilingConfig
-from .pretty import print_eval_results
+from .pretty import print_eval_results, BANNER
+
+
+def _suppress_tyro_usage_line() -> None:
+    """Drop tyro's hardcoded ``usage: train.py [-h] [OPTIONS]`` header from --help.
+
+    tyro has no option to disable it: its help formatter unconditionally renders the
+    usage line, then a blank line, then the description (our banner). We wrap that
+    formatter (the default backend calls it as a module attribute, so patching the
+    attribute takes effect) and slice off everything up to and including the first
+    blank line, leaving the banner as the first thing shown. This reaches into tyro
+    internals and may need revisiting on a tyro upgrade."""
+    from tyro._backends import _tyro_help_formatting as hf
+
+    if getattr(hf.format_help, "_usage_stripped", False):
+        return
+    _orig = hf.format_help
+
+    def format_help(*args, **kwargs):
+        lines = _orig(*args, **kwargs)
+        for i, line in enumerate(lines):
+            if line == "":              # first blank line ends the usage block
+                return lines[i + 1:]
+        return lines
+
+    format_help._usage_stripped = True
+    hf.format_help = format_help
+
+
+_suppress_tyro_usage_line()
 
 
 @dataclass
@@ -143,7 +172,7 @@ def run(cfg: ExperimentConfig, logger: MLSweepLogger):
         print("\nInterrupted by user, exiting early.")
 
 def main():
-    cfg = tyro.cli(ExperimentConfig)
+    cfg = tyro.cli(ExperimentConfig, description=BANNER)
     with MLSweepLogger() as logger:
         run(cfg, logger)
 
