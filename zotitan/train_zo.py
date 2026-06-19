@@ -1,5 +1,4 @@
 import collections
-import itertools
 import math
 import os
 import time
@@ -53,15 +52,14 @@ class MomentumConfig:
     """
 
     momentum_method: Literal["none", "stored_ema", "seed_window"] = "none"
-    """How the first-moment direction m_t is maintained.
+    """How the first-moment direction is maintained.
     none:        no momentum.
     stored_ema:  full EMA vector updated every step. Uses as much memory as the trainable params.
     seed_window: memory-efficient reconstruction from a circular buffer of RNG snapshots.
                  Does not use memory, but recomputes the z distributions from seeds over a step window."""
 
     beta1: float = 0.9
-    """EMA decay for stored_ema momentum updates and bias correction; also the base
-    β₁ for the β₁^i decay weights in seed_window "exp" mode."""
+    """First-moment EMA decay (active when momentum_method="stored_ema"|"seed_window")"""
 
     beta2: float = 0.999
     """Second-moment EMA decay (active when second_moment=True). Adam's β₂."""
@@ -80,30 +78,10 @@ class SeedWindowConfig:
     """Number of past seeds to retain in the circular buffer.
     0 disables seed-window momentum."""
 
-    decay: Literal["exp", "lin", "cos", "log"] = "exp"
-    """Importance decay schedule across the window (newest = index 0, highest weight).
-    exp: w_i = β₁^i
-
-    Not principled but potentially interesting to run ablations on. Probably don't use these.
-    lin: w_i = (n - i) / n
-    cos: w_i = ½(1 + cos(πi/n))
-    log: w_i = log(n - i + 1)"""
-
 
 @dataclass
 class ClipConfig:
-    """Clipping of the projected-gradient scalar (L₊-L₋)/2ε.
-
-    This is NOT full parameter-space gradient-norm clipping. proj_grad is the gradient
-    projected onto z, with scale ≈ ‖g‖ (dimension-free), so clipping it directly is the
-    natural ZO knob. Because the per-pair zⱼ are near-orthogonal in high dimension,
-    ‖grad_est‖ ≈ (√d/Z)·‖proj_grad_vec‖₂, so even the "norm" strategy needs only the
-    z_batch scalars — never a parameter-sized reduction.
-
-    The threshold is adaptive: the (1−clip_pct) empirical quantile of recent |proj_grad|,
-    estimated over a rolling window. This targets a fixed clip *rate* rather than a fixed
-    magnitude, so it tracks the natural drift of the proj_grad scale over training.
-    """
+    """Clipping of the projected-gradient scalar (L₊-L₋)/2ε."""
 
     strategy: Literal["none", "per_pair", "norm"] = "none"
     """How the threshold τ is applied to a step's projected gradients:
@@ -139,30 +117,21 @@ class PerturbationConfig:
 
 @dataclass
 class FitnessShapingConfig:
-    """OpenAI-ES-style fitness shaping over the per-step population of perturbations.
+    strategy: Literal["none", "centered_rank", "grpo"] = "none"
+    """Fitness shaping over the per-step population of perturbations (OpenAI-ES or GRPO).
 
-    With strategy="centered_rank" the raw two-point slope (L₊-L₋)/2ε is discarded. Instead all
-    2·z_batch perturbation evaluations in the step are ranked by fitness (= -value, since value is
-    MINIMIZED) and mapped to centered-rank utilities in [-0.5, 0.5]. Each pair's z is then weighted
-    by (u₋ - u₊) — the net coefficient of zⱼ from its antithetic ±z members — giving an update that
-    points uphill in loss, so the usual θ -= lr·grad_est descends. This rank transform is what makes
-    ES scale-invariant to the loss and robust to outlier fitnesses, unlike the raw slope.
+    none: plain ZO slope (MeZO).
+    centered_rank:  OpenAI-ES. Sort the perturbation population and map to [-0.5, 0.5] by position in the list.
+    grpo:           Group-relative normalization (like GRPO)
 
-    Reuses the existing machinery: the z_batch loop is the ES population, run_forward_passes the
-    antithetic ±ε evaluation, and grad_est/momentum/second-moment the update (so ES+Adam is free).
-    Only the per-pair scalar that multiplies z changes — that scalar still flows through seed_window
-    replay verbatim. Because grad_est can't hold the whole population of param-sized z at once, the
-    shaped pass regenerates each zⱼ from its seed (the same trick as seed_window momentum).
-
-    Ranking is only meaningful when every member is scored on the SAME data, so centered_rank
-    requires the top-level ZOConfig.shared_batch=True (see its docstring for the variance
-    rationale). It is also mutually exclusive with proj-grad clipping (the rank transform already
-    bounds each member's influence). For a population of one (z_batch=1) it degenerates to signSGD
-    on the slope — ES needs a real population to be meaningful.
+    Both transforms are only meaningful when every member is scored on the same data, so they require
+    ZOConfig.shared_batch=True. Also mutually exclusive with and can be seen as an alternative to
+    grad clipping.
     """
 
-    strategy: Literal["none", "centered_rank"] = "none"
-    """none: plain ZO slope (MeZO). centered_rank: OpenAI-ES centered-rank fitness shaping."""
+    normalize_std: bool = True
+    """Only valid with grpo. Divide each advantage by the population's std so the update's size
+    doesn't depend on reward scale."""
 
 
 @dataclass
@@ -253,15 +222,13 @@ class ZOOptimizer:
     def __init__(self, named_params: list, cfg: ZOConfig, score_fn, total_steps: int = 0):
         self.named_params   = named_params
         self.cfg            = cfg
-        self.score_fn       = score_fn      # objective.score: (model, batch) -> Score(value, metrics)
+        self.score_fn       = score_fn
         self._t             = 0
         self._total_steps   = total_steps
         self.has_momentum   = cfg.mom.momentum_method != "none"
-
         self._seed_ctr = 0
 
         # Rolling window of recent |proj_grad| for the adaptive quantile clip threshold.
-        # Only allocated when clipping is on; the threshold lags one step (see ClipConfig).
         self._pg_hist = collections.deque(maxlen=cfg.clip.window) \
             if cfg.clip.strategy != "none" and cfg.clip.clip_pct > 0 else None
 
@@ -273,9 +240,6 @@ class ZOOptimizer:
             self.seed_buf = collections.deque(maxlen=buf_cap)
             self.proj_buf = collections.deque(maxlen=buf_cap)
 
-        # Adam/RMSProp second moment: always materialized (one param-sized buffer),
-        # independent of the first-moment backend. See MomentumConfig for why it is not
-        # reconstructed from seeds even on the memory-free seed_window path.
         if cfg.mom.second_moment:
             self.v = [torch.zeros_like(p) for _, p in named_params]
 
@@ -286,10 +250,10 @@ class ZOOptimizer:
         self.shaping = cfg.fitness.strategy != "none"
         if self.shaping:
             assert cfg.shared_batch, \
-                "centered_rank fitness shaping requires shared_batch=True, because " \
-                "ranks are only comparable when all z are scored on the same batch."
+                f"{cfg.fitness.strategy} fitness shaping requires shared_batch=True, because the " \
+                "population transform is only comparable when all z are scored on the same batch."
             assert not (cfg.clip.strategy != "none" and cfg.clip.clip_pct > 0), \
-                "centered_rank fitness shaping is mutually exclusive with proj_grad clipping."
+                f"{cfg.fitness.strategy} fitness shaping is mutually exclusive with proj_grad clipping."
 
 
     # ── perturbation ──────────────────────────────────────────────────────────
@@ -308,7 +272,7 @@ class ZOOptimizer:
         rank     = self.cfg.perturbation.rank
         n_params = len(self.named_params)
         for i, (_, p) in enumerate(self.named_params):
-            # Derive a per-param seed so each parameter gets an independent stream.
+            # Derive a seed for each param buffer
             param_seed = (seed * n_params + i) & 0x7FFFFFFF
             z = _philox_randn(param_seed, p.numel(), p.device).view(p.shape)
             if p.ndim >= 2 and dist != "gaussian":
@@ -332,7 +296,7 @@ class ZOOptimizer:
         return result
 
     def _get_gradient_ema(self) -> list:
-        """Return the first-moment estimate m̂_t (the update direction): a weighted average
+        """Return the first-moment estimate (the update direction): a weighted average
         of past gradient estimates with total weight 1, so it carries gradient magnitude on
         the same scale as a single estimate (matching plain MeZO, so lr transfers)."""
         mc = self.cfg.mom
@@ -343,51 +307,16 @@ class ZOOptimizer:
             return self._reconstruct_momentum_from_seeds()
 
     def _reconstruct_momentum_from_seeds(self) -> list:
-        """Rebuild the first-moment EMA from the seed buffer (memory-free momentum).
-
-        Each past step stored one seed per (z, batch) pair plus that pair's clipped
-        projected gradient, so each step's grad_est is replayed exactly as
-        (1/Z) Σⱼ proj_gradⱼ·zⱼ. The window is combined as a decay-weighted *average* —
-        weights normalised by their L1 sum so the total is 1 — keeping the result on the
-        same scale as a single gradient estimate (matching the stored_ema bias-corrected
-        EMA; for decay="exp" the L1 normalisation reproduces the (1−β₁^n) bias correction
-        exactly). For decay="cos"/"lin"/"log" it is an honest finite-window weighted average.
-        """
-        sw      = self.cfg.seed_window
-        buf_len = len(self.seed_buf)
-
-        if sw.decay == "lin":
-            mom_decay_weights = [(buf_len - i) / buf_len for i in range(buf_len)]
-        elif sw.decay == "cos":
-            mom_decay_weights = [0.5 * (1.0 + math.cos(math.pi * i / buf_len)) for i in range(buf_len)]
-        elif sw.decay == "exp":
-            beta1 = self.cfg.mom.beta1
-            mom_decay_weights = [(1 - beta1) * beta1 ** i for i in range(buf_len)]
-        elif sw.decay == "log":
-            mom_decay_weights = [math.log1p(buf_len - i) for i in range(buf_len)]
-        else:
-            raise ValueError(f"Invalid seed window config decay: {sw.decay}")
-
-        # Flatten the window into per-pair contributions (seed, effective weight), replaying
-        # each past pair's z scaled by its signed projected gradient so the result is the
-        # decayed EMA of gradient estimates (MeZO-momentum, MeZO Appendix B). Divide by the
-        # L1 total weight so the window is a weighted AVERAGE (total weight 1) — carrying
-        # gradient magnitude, not Σdecay × it, which would inflate the step ~Σdecay-fold.
-        total = sum(mom_decay_weights) + 1e-12
-        entries: list[tuple[int, float]] = []
-        steps = zip(itertools.islice(self.seed_buf, buf_len),
-                    itertools.islice(self.proj_buf, buf_len),
-                    mom_decay_weights)
-        for step_seeds, step_proj_grads, step_mom_weight in steps:
-            w = step_mom_weight / (len(step_seeds) * total)
-            for seed, proj_grad in zip(step_seeds, step_proj_grads):
-                entries.append((seed, w * proj_grad))
+        """Rebuild the first-moment EMA from the seed window"""
+        beta1   = self.cfg.mom.beta1
+        weights = [beta1 ** i for i in range(len(self.seed_buf))]
+        total   = sum(weights) + 1e-12
 
         momentum = [torch.zeros_like(p) for _, p in self.named_params]
-        for seed, weight in entries:
-            # Regenerate this pair's z from its seed and add it weighted into the buffer.
-            torch._foreach_add_(momentum, self._sample_z(seed), alpha=weight)
-
+        for step_seeds, step_proj_grads, step_weight in zip(self.seed_buf, self.proj_buf, weights):
+            w = step_weight / (len(step_seeds) * total)
+            for seed, proj_grad in zip(step_seeds, step_proj_grads):
+                torch._foreach_add_(momentum, self._sample_z(seed), alpha=w * proj_grad)
         return momentum
 
     # ── forward passes ────────────────────────────────────────────────────────
@@ -524,6 +453,17 @@ class ZOOptimizer:
         utils = self._centered_ranks([-v for v in vals])
         return [utils[2 * j + 1] - utils[2 * j] for j in range(len(vals) // 2)]
 
+    def _grpo_advantages(self, vals: list[float]) -> list[float]:
+        """GRPO-style group-relative advantage shaping"""
+        n     = len(vals)
+        mean  = sum(vals) / n
+        adv   = [mean - v for v in vals]
+        if self.cfg.fitness.normalize_std:
+            var = sum(a * a for a in adv) / n
+            std = math.sqrt(var)
+            adv = [a / (std + 1e-8) for a in adv]
+        return [adv[2 * j + 1] - adv[2 * j] for j in range(n // 2)]
+
     def step(self, model, batches: list[dict]) -> dict:
         self._t += 1
         cfg       = self.cfg
@@ -583,11 +523,12 @@ class ZOOptimizer:
         mean_loss: float  = sum(vals) / len(vals)
 
         if self.shaping:
-            # ES path: rank the whole population's fitness, then build grad_est by regenerating
-            # each zⱼ from its seed and weighting by its shaped scalar (the z's themselves were
-            # not kept — too large to hold a full population at once). pgc carries the shaped
-            # scalars so seed_window replay reconstructs the same gradient; clipping is off.
-            pgc       = self._shape_fitness(vals)
+            # ES/GRPO path: transform the whole population's fitness, then build grad_est by
+            # regenerating each zⱼ from its seed and weighting by its shaped scalar (the z's
+            # themselves were not kept — too large to hold a full population at once). pgc carries
+            # the shaped scalars so seed_window replay reconstructs the same gradient; clipping is off.
+            pgc       = (self._grpo_advantages(vals) if cfg.fitness.strategy == "grpo"
+                         else self._shape_fitness(vals))
             grad_est  = [torch.zeros_like(p) for _, p in self.named_params]
             for j, seed in enumerate(pair_seeds):
                 torch._foreach_add_(grad_est, self._sample_z(seed), alpha=pgc[j] / z_batch)
@@ -637,8 +578,6 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
     named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     n_params     = sum(p.numel() for _, p in named_params)
     device       = next(model.parameters()).device
-    # Atomic objectives yield plain tensor dicts → use PrefetchLoader's fast pin path.
-    # Mixtures yield tagged (i, batch) items → route the device move through to_device.
     move_fn      = None if getattr(objective, "flat_batches", True) else objective.to_device
     loader       = PrefetchLoader(objective.train_batches(tokenizer, seed, cfg.batch_size), device, move_fn=move_fn)
     run_dir      = os.environ.get("MLSWEEP_RUN_DIR", ".")
@@ -648,18 +587,18 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
 
     print(f"  ZO train: {total_steps:,} steps | {n_params:,} params")
     model.eval()
-    show_lr    = not wsd_is_constant(cfg.base.lr_wsd)   # a constant LR is already in the config dump
+    show_lr    = not wsd_is_constant(cfg.base.lr_wsd)
     overfit    = cfg.base.overfit_first_batch
     if overfit:
         print("  overfit: reusing the first batch every step")
-    fixed_batches = None                               # the cached first draw (overfit only)
+    fixed_batches = None
 
     with maybe_enable_profiling(profiling_cfg or ProfilingConfig(), run_dir=run_dir) as torch_profiler:
         for step in range(total_steps):
             if fixed_batches is not None:
                 batches = fixed_batches
             elif cfg.shared_batch or overfit:
-                # ES/Fitness Shaping (and overfit): score the whole z-population on one batch.
+                # For ES/GRPO Fitness Shaping. Scores the whole z-population on one batch.
                 one = get_batches(loader, 1)
                 batches = one * cfg.z_batch if one is not None else None
             else:
