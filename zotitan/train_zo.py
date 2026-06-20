@@ -116,6 +116,26 @@ class PerturbationConfig:
 
 
 @dataclass
+class WeightDecayConfig:
+    strategy: Literal["none", "standard", "anchored"] = "none"
+    """Weight decay strategy.
+    none:     no weight decay.
+    standard: decay each parameter toward zero. θ -= lr * λ * θ.
+    anchored: Anchored Weight Decay (AWD) — decay toward the initial model parameters.
+              θ -= lr * λ * l'(θ - θ₀) where l' is the derivative of the penalty function."""
+
+    lambda_: float = 0.0
+    """Weight decay strength λ. Multiplied by the learning rate at each step.
+    For standard: the coefficient of decay toward zero.
+    For anchored: the AWD penalty factor."""
+
+    penalty: Literal["l2", "l1"] = "l2"
+    """Penalty function l(·) for anchored weight decay only.
+    l2: ℓ₂ penalty — l'(x)=x, smooth shrinkage toward anchor θ₀.
+    l1: ℓ₁ penalty — l'(x)=sign(x), sparse deviation from anchor θ₀."""
+
+
+@dataclass
 class FitnessShapingConfig:
     strategy: Literal["none", "centered_rank", "grpo"] = "none"
     """Fitness shaping over the per-step population of perturbations (OpenAI-ES or GRPO).
@@ -174,6 +194,7 @@ class ZOConfig:
     perturbation: PerturbationConfig   = field(default_factory=PerturbationConfig)
     clip:         ClipConfig           = field(default_factory=ClipConfig)
     fitness:      FitnessShapingConfig = field(default_factory=FitnessShapingConfig)
+    weight_decay: WeightDecayConfig    = field(default_factory=WeightDecayConfig)
 
 
 @maybe_torchcompile
@@ -221,6 +242,7 @@ def _aggregate_metrics(dicts: list[dict]) -> dict[str, float]:
 class ZOOptimizer:
     def __init__(self, named_params: list, cfg: ZOConfig, score_fn, total_steps: int = 0):
         self.named_params   = named_params
+        self.params         = [p.data for _, p in named_params]
         self.cfg            = cfg
         self.score_fn       = score_fn
         self._t             = 0
@@ -246,6 +268,10 @@ class ZOOptimizer:
         if cfg.perturbation.distribution != "gaussian":
             assert cfg.mom.momentum_method != "seed_window", \
                 "seed_window momentum is incompatible with non-gaussian perturbation distributions"
+
+        self._wd_enabled = cfg.weight_decay.strategy != "none" and cfg.weight_decay.lambda_ > 0
+        if cfg.weight_decay.strategy == "anchored" and self._wd_enabled:
+            self.theta_0 = [p.data.clone().cpu().pin_memory() for _, p in named_params]
 
         self.shaping = cfg.fitness.strategy != "none"
         if self.shaping:
@@ -322,7 +348,7 @@ class ZOOptimizer:
     # ── forward passes ────────────────────────────────────────────────────────
 
     def _apply_z(self, z: list, scale: float):
-        torch._foreach_add_([p.data for _, p in self.named_params], z, alpha=scale)
+        torch._foreach_add_(self.params, z, alpha=scale)
 
     def run_forward_passes(self, model, batch, z: list, score_fn) -> tuple[tuple[torch.Tensor, dict],
                                                                            tuple[torch.Tensor, dict]]:
@@ -351,9 +377,18 @@ class ZOOptimizer:
     def _apply_update(self, grad: list, lr: torch.Tensor):
         """Step along grad (the first moment / gradient estimate; the projected-gradient
         scalar is already folded in). With second_moment on, divide by the bias-corrected
-        √v per dim — the Adam/RMSProp denominator."""
+        √v per dim — the Adam/RMSProp denominator.
+
+        Also applies weight decay according to the configured strategy.
+        The AWD paper applies decay after the update, rather than before as standard in Adam, etc.
+        Does this matter? I don't know, probably. But the paper doesn't say anything
+        about it, so who knows.
+        """
         mc     = self.cfg.mom
-        params = [p.data for _, p in self.named_params]
+        params = self.params
+        wd     = self.cfg.weight_decay
+        lam    = wd.lambda_ * lr
+
         if mc.second_moment:
             bc2   = 1.0 - mc.beta2 ** self._t
             v_hat = torch._foreach_div(self.v, bc2)
@@ -362,6 +397,14 @@ class ZOOptimizer:
             torch._foreach_addcdiv_(params, grad, v_hat, value=-lr)  # type: ignore
         else:
             torch._foreach_add_(params, grad, alpha=-lr)  # type: ignore
+
+        if wd.strategy == "standard":
+            torch._foreach_mul_(self.params, 1.0 - lam)
+        elif wd.strategy == "anchored":
+            l1 = wd.penalty == "l1"
+            for (_, p), p0 in zip(self.named_params, self.theta_0):
+                diff = p.data - p0.to(p.device, non_blocking=True)
+                p.data.sub_(torch.sign(diff) if l1 else diff, alpha=lam)
 
     def _update_optimizer_state(self, grad_est: list,
                                 pair_seeds: list[int], pair_grads: list[float]):

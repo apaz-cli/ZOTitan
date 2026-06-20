@@ -19,6 +19,9 @@ class FOConfig:
     batch_size: int = 40
     """Per-step batch size."""
 
+    weight_decay: float = 0.0
+    """Weight decay coefficient, passed directly to AdamW. 0 = disabled."""
+
 
 def train_fo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: FOConfig | None = None, objective=None, profiling_cfg: ProfilingConfig | None = None):
     """
@@ -33,7 +36,8 @@ def train_fo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: FOConfi
         objective = make_objective("scijudge")
 
     base     = cfg.base
-    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=base.lr)
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=base.lr,
+                      weight_decay=cfg.weight_decay)
     loader    = objective.train_batches(tokenizer, seed, cfg.batch_size)
     device    = next(model.parameters()).device
     run_dir   = os.environ.get("MLSWEEP_RUN_DIR", ".")

@@ -85,7 +85,7 @@ class CrossEntropyCriterion:
         self.fn               = get_xentropy(fused=self.fused, compile_mode=self.compile_mode)
 
     def __call__(self, model, batch):
-        loss, z_loss, extra = self.fn(model, batch, z_loss_weight, compute_accuracy) # type: ignore
+        loss, z_loss, extra = self.fn(model, batch, self.z_loss_weight, self.compute_accuracy) # type: ignore
         value = loss if z_loss is None else loss + z_loss
         metrics: dict[str, Metric] = {"ce": loss}
         if z_loss is not None:
