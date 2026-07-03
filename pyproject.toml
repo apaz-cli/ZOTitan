@@ -1,6 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ZOTitan"
 version = "0.1.0"
+description = "Zeroth-order optimization training and experiments"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{ name = "Aaron Pazdera", email = "aarpazdera@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.11",
@@ -8,12 +16,20 @@ dependencies = [
     "datasets>=3.0",
     "accelerate>=1.0",
     "liger-kernel>=0.8",
+    "mlsweep>=2.0",
     "tqdm",
     "tyro>=1.0",
 ]
 
-[tool.pytest.ini_options]
-pythonpath = ["."]
+[project.urls]
+GitHub = "https://github.com/apaz-cli/ZOTitan"
+
+[project.scripts]
+zotitan_train = "zotitan.train:main"
+zotitan_eval = "zotitan.eval:main"
 
 [tool.setuptools.packages.find]
 include = ["zotitan*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
