@@ -22,9 +22,24 @@ class ModelConfig:
     model's usable context; the single source of truth, threaded into each objective at
     build time (objectives never reach for a global)."""
 
+    hidden: int | None = None
+    """Override the GRU hidden size for tiny models (width scaling). None = arch default."""
+
+    num_layers: int | None = None
+    """Override the GRU layer count for tiny models (depth scaling). None = arch default."""
+
 
 def load_model(cfg: ModelConfig):
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+    # Local (non-HF) toy models built in pure torch: selecting one as model_id builds
+    # it from tiny_model.py instead of downloading pretrained weights. TINY_ARCHS is
+    # the only list of which ids exist — don't mirror it here, or the two drift.
+    from .tiny_model import TINY_ARCHS, build_tiny
+    if cfg.model_id in TINY_ARCHS:
+        model, tokenizer = build_tiny(cfg.model_id, hidden=cfg.hidden, num_layers=cfg.num_layers)
+        return model.to(dtype=torch.bfloat16).cuda(), tokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     assert tokenizer.pad_token_id is not None, \
         "tokenizer has no pad_token — add: tokenizer.pad_token = tokenizer.eos_token"

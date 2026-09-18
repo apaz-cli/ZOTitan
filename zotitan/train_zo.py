@@ -11,7 +11,7 @@ from .data import PrefetchLoader, get_batches
 from .pretty import print_config, print_zo_step
 from . import profiling
 from .profiling import ProfilingConfig, maybe_enable_profiling
-from .schedule import wsd_value, wsd_is_constant, BaseTrainConfig, maybe_torchcompile
+from .schedule import wsd_value, wsd_is_constant, BaseTrainConfig, maybe_torchcompile, LossKillGuard
 from .lora import save_merged_checkpoint
 
 
@@ -309,7 +309,8 @@ class ZOOptimizer:
                 p_seed = (seed * n_params + i + 2 * n_params) & 0x7FFFFFFF
                 P      = _philox_randn(p_seed, m * r, p.device).view(m, r).to(p.dtype)
                 if dist == "polar":
-                    P, _ = torch.linalg.qr(P)
+                    P, _ = torch.linalg.qr(P.float())
+                    P = P.to(p.dtype)
                 psi_seed = (seed * n_params + i + n_params) & 0x7FFFFFFF
                 Psi  = _philox_randn(psi_seed, r * p.shape[1], p.device).view(r, p.shape[1]).to(p.dtype)
                 if dist == "polar":
@@ -636,6 +637,8 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
         print("  overfit: reusing the first batch every step")
     fixed_batches = None
 
+    kill_guard = LossKillGuard(cfg.base)
+
     with maybe_enable_profiling(profiling_cfg or ProfilingConfig(), run_dir=run_dir) as torch_profiler:
         for step in range(total_steps):
             if fixed_batches is not None:
@@ -661,6 +664,9 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
 
             logger.log(metrics)
             print_zo_step(step, total_steps, metrics, show_lr=show_lr)
+
+            if kill_guard.should_stop(metrics["loss"]):
+                break
 
             if torch_profiler:
                 torch_profiler.step()

@@ -9,7 +9,7 @@ from .objective import floatify
 from .pretty import print_config, print_fo_step
 from . import profiling
 from .profiling import ProfilingConfig, maybe_enable_profiling
-from .schedule import WSDConfig, wsd_value, wsd_is_constant, BaseTrainConfig
+from .schedule import WSDConfig, wsd_value, wsd_is_constant, BaseTrainConfig, LossKillGuard
 
 
 @dataclass
@@ -52,6 +52,8 @@ def train_fo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: FOConfi
         print("  overfit: reusing the first batch every step")
     fixed_batch = None                             # the cached first batch (overfit only)
 
+    kill_guard = LossKillGuard(base)
+
     with maybe_enable_profiling(profiling_cfg or ProfilingConfig(), run_dir=run_dir) as torch_profiler:
         for step in range(total_steps):
             if fixed_batch is not None:
@@ -84,6 +86,9 @@ def train_fo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: FOConfi
             logger.log(metrics)
             print_fo_step(step, total_steps, loss, grad_norm, lr, extra=sm or None,
                           show_lr=show_lr, step_time=step_time)
+
+            if kill_guard.should_stop(loss):
+                break
 
             if torch_profiler:
                 torch_profiler.step()

@@ -31,6 +31,39 @@ class BaseTrainConfig:
     """Debug: draw one batch up front and reuse it every step (loss should drive toward 0).
     A quick way to smoke out objective/optimizer bugs in isolation from the data pipeline."""
 
+    loss_kill_threshold: float = 0.0
+    """Early-termination threshold on the per-step loss. If `loss` stays above this
+    value for `loss_kill_threshold_patience` consecutive steps, training stops
+    gracefully. 0 disables."""
+
+    loss_kill_threshold_patience: int = 0
+    """Consecutive steps `loss` must exceed `loss_kill_threshold` before training
+    stops. Only active when both are > 0."""
+
+
+class LossKillGuard:
+    """Per-step early-termination check shared by the FO and ZO loops.
+
+    Stops once `loss` has stayed above `loss_kill_threshold` for
+    `loss_kill_threshold_patience` consecutive steps; inactive (never stops) when
+    either knob is 0. Copies the two thresholds out of the config rather than
+    holding it, so the guard outlives nothing it doesn't need."""
+
+    def __init__(self, cfg: BaseTrainConfig):
+        self.threshold = cfg.loss_kill_threshold
+        self.patience  = cfg.loss_kill_threshold_patience
+        self.active    = self.threshold > 0.0 and self.patience > 0
+        self.bad_steps = 0
+
+    def should_stop(self, loss: float) -> bool:
+        if not self.active:
+            return False
+        self.bad_steps = self.bad_steps + 1 if loss > self.threshold else 0
+        if self.bad_steps < self.patience:
+            return False
+        print(f"  loss exceeded {self.threshold} for {self.bad_steps} consecutive steps — stopping early.")
+        return True
+
 
 def maybe_torchcompile(fn=None, *, enabled: bool = True, mode: str | None = None):
     if fn is None:
