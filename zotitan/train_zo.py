@@ -164,6 +164,16 @@ class ZOConfig:
     eps: float = 1e-3
     """MeZO perturbation scale ε. The amount to perturb the model by for each forward pass."""
 
+    weight_quant: Literal["none", "fp8_e4m3", "fp8_e5m2"] = "none"
+    """Weight-only quantization: round trainable weights to this dtype. In "forward"
+    mode the weights are rounded before every forward (breaks ZO: eps < fp8 step gets
+    rounded away); in "once" mode they're rounded once at start and the bf16
+    perturbation lives on top (QAT-style — ZO works, ~bf16 lr/eps)."""
+
+    weight_quant_mode: Literal["forward", "once"] = "forward"
+    """When weight_quant != none: "forward" rounds before each forward, "once" rounds
+    only at the start of training."""
+
     batch_size: int = 40
     """Per-direction batch size B: the number of examples each (z, ±ε) pair is scored on.
     Orthogonal to z_batch. Total samples per step are batch_size * z_batch."""
@@ -249,6 +259,13 @@ class ZOOptimizer:
         self._total_steps   = total_steps
         self.has_momentum   = cfg.mom.momentum_method != "none"
         self._seed_ctr = 0
+        # fp8 weight-only quantization: in "forward" mode round weights to the fp8
+        # grid before each forward (perturbation ±εz interacts with the quant step);
+        # in "once" mode the bf16 master is perturbed on top of a one-time rounding.
+        self._qdtype = {"none": None, "fp8_e4m3": torch.float8_e4m3fn,
+                        "fp8_e5m2": torch.float8_e5m2}[cfg.weight_quant]
+        if cfg.weight_quant_mode == "once":
+            self._qdtype = None
 
         # Rolling window of recent |proj_grad| for the adaptive quantile clip threshold.
         self._pg_hist = collections.deque(maxlen=cfg.clip.window) \
@@ -359,6 +376,9 @@ class ZOOptimizer:
         scalar to minimize; metrics is the score's breakdown dict (tensors kept lazy
         so the two passes don't sync between them)."""
         def acquire() -> tuple[torch.Tensor, dict]:
+            if self._qdtype is not None:
+                for p in self.params:
+                    p.data = p.data.float().to(self._qdtype).to(p.data.dtype)
             s = score_fn(model, batch)
             value = s.value if isinstance(s.value, torch.Tensor) else torch.tensor(float(s.value))
             return value, s.metrics
@@ -620,6 +640,11 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
         objective = make_objective("scijudge")
 
     named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if cfg.weight_quant != "none" and cfg.weight_quant_mode == "once":
+        qdtype = torch.float8_e4m3fn if cfg.weight_quant == "fp8_e4m3" else torch.float8_e5m2
+        for _, p in named_params:
+            p.data = p.data.float().to(qdtype).to(p.data.dtype)
+        print(f"  weight quant (once): {cfg.weight_quant}")
     n_params     = sum(p.numel() for _, p in named_params)
     device       = next(model.parameters()).device
     move_fn      = None if getattr(objective, "flat_batches", True) else objective.to_device

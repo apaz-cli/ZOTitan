@@ -28,6 +28,12 @@ class ModelConfig:
     num_layers: int | None = None
     """Override the GRU layer count for tiny models (depth scaling). None = arch default."""
 
+    num_experts: int | None = None
+    """Number of MoE experts for tiny models. None = arch default (1 = no MoE)."""
+
+    top_k: int | None = None
+    """Top-k experts routed to per token for tiny models. None = arch default."""
+
 
 def load_model(cfg: ModelConfig):
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -37,7 +43,8 @@ def load_model(cfg: ModelConfig):
     # the only list of which ids exist — don't mirror it here, or the two drift.
     from .tiny_model import TINY_ARCHS, build_tiny
     if cfg.model_id in TINY_ARCHS:
-        model, tokenizer = build_tiny(cfg.model_id, hidden=cfg.hidden, num_layers=cfg.num_layers)
+        model, tokenizer = build_tiny(cfg.model_id, hidden=cfg.hidden, num_layers=cfg.num_layers,
+                                      num_experts=cfg.num_experts, top_k=cfg.top_k)
         return model.to(dtype=torch.bfloat16).cuda(), tokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)

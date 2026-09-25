@@ -102,11 +102,41 @@ class TinyStoryDecoder(nn.Module):
         return DecoderOutput(last_hidden_state=out)
 
 
+class MoEBlock(nn.Module):
+    """Minimal top-k MoE feed-forward block (for hparam-transfer experiments)."""
+
+    def __init__(self, hidden: int, num_experts: int, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+        self.router = nn.Linear(hidden, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden, 4 * hidden, bias=False),
+                          nn.GELU(),
+                          nn.Linear(4 * hidden, hidden, bias=False))
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, H] -> weighted sum of top-k expert outputs.
+        logits = self.router(x)                       # [B, T, E]
+        topk_vals, topk_idx = torch.topk(logits, self.top_k, dim=-1)
+        weights = torch.softmax(topk_vals, dim=-1)    # [B, T, k]
+        out = torch.zeros_like(x)
+        for e in range(len(self.experts)):
+            w = (weights * (topk_idx == e)).sum(dim=-1)   # [B, T]
+            sel = w > 0
+            if sel.any():
+                out[sel] += w[sel].unsqueeze(-1) * self.experts[e](x[sel])
+        return out
+
+
 class TinyStoryLM(nn.Module):
     def __init__(self, vocab_size: int, d_model: int = 128, hidden: int = 1024,
-                 num_layers: int = 2, pad_token_id: int = 0):
+                 num_layers: int = 2, pad_token_id: int = 0,
+                 num_experts: int = 1, top_k: int = 1):
         super().__init__()
         self.decoder = TinyStoryDecoder(vocab_size, d_model, hidden, num_layers, pad_token_id)
+        self.moe = MoEBlock(hidden, num_experts, top_k) if num_experts > 1 else None
         self.lm_head = nn.Linear(hidden, vocab_size, bias=False)
 
     # ── HF API surface used by losses.py ─────────────────────────────────────
@@ -119,6 +149,10 @@ class TinyStoryLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 labels: torch.Tensor | None = None) -> LMOutput:
         hidden = self.decoder(input_ids, attention_mask).last_hidden_state
+        if self.moe is not None:
+            # Residual MoE FFN (standard MoE-in-block structure): the experts refine
+            # the GRU's hidden state rather than replacing it.
+            hidden = hidden + self.moe(hidden)
         logits = self.lm_head(hidden)          # (B, T, V)
         loss = None
         if labels is not None:
@@ -161,7 +195,8 @@ def _build_tokenizer(kind: str):
     raise ValueError(f"unknown tokenizer kind {kind!r}")
 
 
-def build_tiny(model_id: str, hidden: int | None = None, num_layers: int | None = None) -> tuple[TinyStoryLM, object]:
+def build_tiny(model_id: str, hidden: int | None = None, num_layers: int | None = None,
+               num_experts: int | None = None, top_k: int | None = None) -> tuple[TinyStoryLM, object]:
     """Build (model, tokenizer) for a tiny-model id. Device/dtype are the caller's job."""
     arch = TINY_ARCHS.get(model_id)
     if arch is None:
@@ -171,5 +206,9 @@ def build_tiny(model_id: str, hidden: int | None = None, num_layers: int | None 
         kw["hidden"] = hidden
     if num_layers is not None:
         kw["num_layers"] = num_layers
+    if num_experts is not None:
+        kw["num_experts"] = num_experts
+    if top_k is not None:
+        kw["top_k"] = top_k
     tokenizer, vocab_size, pad_token_id = _build_tokenizer(arch["tokenizer"])
     return TinyStoryLM(vocab_size=vocab_size, pad_token_id=pad_token_id, **kw), tokenizer
