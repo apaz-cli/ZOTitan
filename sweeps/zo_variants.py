@@ -6,22 +6,22 @@
 #   momentum     — none | stored_ema | seed_window   (first moment)
 #   second_moment — off | on                          (Adam/RMSProp denominator)
 
-COMMAND      = ["bash", "run.sh", "train.py", "--optimizer", "zo", "--lora.strategy", "none"]
+COMMAND      = ["python", "train.py", "--optimizer", "zo", "--lora.strategy", "none"]
 GPUS_PER_RUN = 1
 
 OPTIONS = {
     ".momentum": {
         "flags": {
             "none":        [],
-            "stored_ema":  ["--zo.mom.momentum_method", "stored_ema"],
-            "seed_window": ["--zo.mom.momentum_method", "seed_window", "--zo.seed_window.size", "20"],
+            "stored_ema":  ["--zo.mom.momentum-method", "stored_ema"],
+            "seed_window": ["--zo.mom.momentum-method", "seed_window", "--zo.seed-window.size", "20"],
         },
         "name": "mom",
     },
     ".second_moment": {
         "flags": {
             "off": [],
-            "on":  ["--zo.mom.second_moment"],
+            "on":  ["--zo.mom.second-moment"],
         },
         "name": "2m",
     },

@@ -2,7 +2,7 @@
 # Evaluate checkpoints on SciJudgeBench splits.
 # Add checkpoint paths to .checkpoint as training runs complete.
 
-COMMAND      = ["bash", "run.sh", "eval.py"]
+COMMAND      = ["python", "eval.py"]
 GPUS_PER_RUN = 1
 
 OPTIONS = {

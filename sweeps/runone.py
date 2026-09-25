@@ -7,7 +7,7 @@
 
 import os
 
-COMMAND = ["bash", "run.sh", "train.py"]
+COMMAND = ["python", "train.py"]
 
 GPUS_PER_RUN = 1
 

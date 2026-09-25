@@ -1,6 +1,6 @@
 #!/usr/bin/env mlsweep_run
 
-COMMAND = ["bash", "run.sh", "train.py"]
+COMMAND = ["python", "train.py"]
 
 GPUS_PER_RUN = 1   # each condition uses one GPU
 

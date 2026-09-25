@@ -40,11 +40,11 @@ EXTRA_FLAGS = ["--zo.batch-size", "16", "--zo.z-batch", "16", "--zo.eps", "0.001
 OPTIONS = {
     ".depth": {
         "flags": {
-            "5m":  ["--model.num_layers", "1"],
-            "10m": ["--model.num_layers", "2"],
-            "15m": ["--model.num_layers", "3"],
-            "20m": ["--model.num_layers", "4"],
-            "25m": ["--model.num_layers", "5"],
+            "5m":  ["--model.num-layers", "1"],
+            "10m": ["--model.num-layers", "2"],
+            "15m": ["--model.num-layers", "3"],
+            "20m": ["--model.num-layers", "4"],
+            "25m": ["--model.num-layers", "5"],
         },
         "name": "d",
     },

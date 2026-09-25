@@ -16,7 +16,7 @@ dependencies = [
     "datasets>=3.0",
     "accelerate>=1.0",
     "liger-kernel>=0.8",
-    "mlsweep>=2.0",
+    "mlsweep>=3.0.0",
     "tqdm",
     "tyro>=1.0",
 ]

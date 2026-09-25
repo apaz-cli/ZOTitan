@@ -2,14 +2,14 @@
 
 COMMAND = [
     "python", "train.py",
-    "--model.model_id", "Qwen/Qwen3-4B",
+    "--model.model-id", "Qwen/Qwen3-4B",
     "--objective", "(countdown)",
-    "--zo.mom.momentum_method", "stored_ema",
+    "--zo.mom.momentum-method", "stored_ema",
     "--zo.mom.second-moment",
-    "--zo.base.overfit_first_batch",
+    "--zo.base.overfit-first-batch",
     "--training.steps", "200",
-    "--zo.batch_size", "16",
-    "--zo.z_batch", "16",
+    "--zo.batch-size", "16",
+    "--zo.z-batch", "16",
     "--lora.strategy", "standard",
     "--lora.r", "16",
 ]

@@ -22,6 +22,27 @@ python3 -m venv .venv
 ./train.py --help
 ```
 
+## Running experiments (sweeps)
+
+Experiments are run with [mlsweep](https://pypi.org/project/mlsweep/). Start with
+`mlsweep --help` for the full command surface, or `mlsweep --help <topic>` (or
+`mlsweep docs`) to read the bundled docs. Sweep configs live in `sweeps/*.py`:
+
+```sh
+mlsweep manager                                              # start the manager (once)
+mlsweep run sweeps/tinystories_zo.py --manager http://localhost:7891 --validate
+mlsweep run sweeps/tinystories_zo.py --manager http://localhost:7891 --stream
+mlsweep watch <experiment_id>                                # live terminal status
+mlsweep fetch --experiment <id> --wait                       # block until done, then leaderboard + download
+mlsweep best  --experiment <id>                              # top runs by metric
+mlsweep status                                               # manager / token / GPU / results check
+```
+
+`run` requires `--manager`. The other commands default to `http://localhost:7891`
+(or `$MLSWEEP_MANAGER`).
+
+Raw results land on the manager at `~/.mlsweep/experiments/<experiment_id>/<run>/`.
+
 ## Training
 
 ```bash
