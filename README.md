@@ -33,13 +33,24 @@ mlsweep manager                                              # start the manager
 mlsweep run sweeps/tinystories_zo.py --manager http://localhost:7891 --validate
 mlsweep run sweeps/tinystories_zo.py --manager http://localhost:7891 --stream
 mlsweep watch <experiment_id>                                # live terminal status
-mlsweep fetch --experiment <id> --wait                       # block until done, then leaderboard + download
+mlsweep fetch --experiment <id> --wait                       # block until done, then leaderboard (exits 1 on failure)
 mlsweep best  --experiment <id>                              # top runs by metric
+mlsweep ls                                                   # list experiments (`mlsweep ls <id>` lists runs)
+mlsweep logs <run_id> --experiment <id>                      # tail a run's training.log
+mlsweep metrics --experiment <id> --keys 'loss' --pivot      # logged metrics, on demand
+mlsweep cancel <id> --failed                                 # cancel jobs (also --running / --all --yes)
+mlsweep retry  <id> --failed                                 # re-queue failed jobs
+mlsweep stop   <id> --yes                                    # abort a sweep
 mlsweep status                                               # manager / token / GPU / results check
 ```
 
 `run` requires `--manager`. The other commands default to `http://localhost:7891`
 (or `$MLSWEEP_MANAGER`).
+
+Experiments group into campaigns (via `--campaign NAME`, else `$MLSWEEP_CAMPAIGN`,
+else `default`): `mlsweep campaign` lists them, `mlsweep campaign move <id> <name>`
+refiles one, and `mlsweep ls --all-campaigns` spans them all. A command on an
+experiment in another campaign exits 1 naming it — rerun with `--campaign <that one>`.
 
 Raw results land on the manager at `~/.mlsweep/experiments/<experiment_id>/<run>/`.
 
