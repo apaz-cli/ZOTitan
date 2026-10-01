@@ -43,6 +43,13 @@ class MomentumConfig:
       seed_window     | off           | 0       | MeZO-momentum (memory-free, m reconstructed)
       seed_window     | on            | 1 (v)   | ZO-Adam (memory-reduced: m reconstructed, v stored)
 
+    Two further knobs reshape the update without adding buffers:
+      second_moment_source=momentum  R-AdaZO (Shu et al., ICML 2025): v is the EMA of m_t²
+                                     (the variance-reduced first moment) instead of g_t².
+                                     With bias_correction=False this is the paper's Algorithm 2.
+      sign_update                    ZO-signSGD (Liu et al., 2019) / Signum with momentum:
+                                     step along sign(m_t). Excludes second_moment.
+
     The second moment v is ALWAYS materialized, even when the seed_window (reconstructed m) first moment is not.
     Reconstructing v from seeds the way m is reconstructed is not viable: g² is nonlinear
     so it does not flatten into the per-seed weighted sum (it has within-step cross terms),
@@ -70,6 +77,20 @@ class MomentumConfig:
 
     denom_eps: float = 1e-8
     """Denominator stabilizer for the bias-corrected EMA and the sqrt(v) second-moment divide."""
+
+    second_moment_source: Literal["grad", "momentum"] = "grad"
+    """What the second moment v is an EMA of.
+    grad:     g_t², the raw gradient estimate (ZO-AdaMM / ZO-RMSProp).
+    momentum: m_t², the first moment (R-AdaZO). Requires momentum_method != "none"."""
+
+    bias_correction: bool = True
+    """Adam-style 1/(1-βᵗ) bias correction of the stored_ema m and of v. R-AdaZO and
+    ZO-AdaMM as published omit it (R-AdaZO: so as not to undo m's variance reduction);
+    without it the first steps are ~1/√(1-β₂) larger than lr. seed_window's reconstructed m
+    is always normalized, so this only affects v there."""
+
+    sign_update: bool = False
+    """Step along sign(m_t) (sign(g_t) without momentum) instead of m_t: ZO-signSGD."""
 
 
 @dataclass
@@ -264,6 +285,11 @@ class ZOOptimizer:
 
         if cfg.mom.second_moment:
             self.v = [torch.zeros_like(p) for _, p in named_params]
+        if cfg.mom.second_moment_source == "momentum":
+            assert cfg.mom.second_moment and self.has_momentum, \
+                "second_moment_source=momentum (R-AdaZO) needs second_moment and a momentum_method"
+        assert not (cfg.mom.sign_update and cfg.mom.second_moment), \
+            "sign_update replaces the second-moment normalization; enable only one"
 
         if cfg.perturbation.distribution != "gaussian":
             assert cfg.mom.momentum_method != "seed_window", \
@@ -328,6 +354,8 @@ class ZOOptimizer:
         the same scale as a single estimate (matching plain MeZO, so lr transfers)."""
         mc = self.cfg.mom
         if self.cfg.mom.momentum_method == "stored_ema":
+            if not mc.bias_correction:
+                return self.m
             bc = 1.0 - mc.beta1 ** self._t
             return [m / (bc + mc.denom_eps) for m in self.m]
         else:
@@ -391,11 +419,13 @@ class ZOOptimizer:
         lam    = wd.lambda_ * lr
 
         if mc.second_moment:
-            bc2   = 1.0 - mc.beta2 ** self._t
+            bc2   = 1.0 - mc.beta2 ** self._t if mc.bias_correction else 1.0
             v_hat = torch._foreach_div(self.v, bc2)
             torch._foreach_sqrt_(v_hat)
             torch._foreach_add_(v_hat, mc.denom_eps)
             torch._foreach_addcdiv_(params, grad, v_hat, value=-lr)  # type: ignore
+        elif mc.sign_update:
+            torch._foreach_add_(params, torch._foreach_sign(grad), alpha=-lr)  # type: ignore
         else:
             torch._foreach_add_(params, grad, alpha=-lr)  # type: ignore
 
@@ -407,23 +437,24 @@ class ZOOptimizer:
                 diff = p.data - p0.to(p.device, non_blocking=True)
                 p.data.sub_(torch.sign(diff) if l1 else diff, alpha=lam)
 
-    def _update_optimizer_state(self, grad_est: list,
-                                pair_seeds: list[int], pair_grads: list[float]):
+    def _update_first_moment(self, grad_est: list,
+                             pair_seeds: list[int], pair_grads: list[float]):
         """Update the first-moment backend (stored_ema EMA, or seed_window's seed/scalar
-        buffers) and, when enabled, the materialized second moment v (EMA of grad_est²).
-        grad_est = (1/Z) Σⱼ clamp(gⱼ)·zⱼ; pair_seeds / pair_grads are this step's per-pair
-        seeds and clamped scalars, stored verbatim so seed_window can replay each z."""
-        cfg = self.cfg
-        mc  = cfg.mom
-        if cfg.mom.momentum_method == "stored_ema":
+        buffers). grad_est = (1/Z) Σⱼ clamp(gⱼ)·zⱼ; pair_seeds / pair_grads are this step's
+        per-pair seeds and clamped scalars, stored verbatim so seed_window can replay each z."""
+        mc = self.cfg.mom
+        if mc.momentum_method == "stored_ema":
             torch._foreach_mul_(self.m, mc.beta1)
             torch._foreach_add_(self.m, grad_est, alpha=(1 - mc.beta1))
-        elif cfg.mom.momentum_method == "seed_window":
+        elif mc.momentum_method == "seed_window":
             self.seed_buf.appendleft(pair_seeds)
             self.proj_buf.appendleft(pair_grads)
-        if mc.second_moment:
-            torch._foreach_mul_(self.v, mc.beta2)
-            torch._foreach_addcmul_(self.v, grad_est, grad_est, value=1 - mc.beta2)
+
+    def _update_second_moment(self, x: list):
+        """v ← β₂v + (1-β₂)x²: x is grad_est (ZO-AdaMM/RMSProp) or m_t (R-AdaZO)."""
+        beta2 = self.cfg.mom.beta2
+        torch._foreach_mul_(self.v, beta2)
+        torch._foreach_addcmul_(self.v, x, x, value=1 - beta2)
 
     def _clip_threshold(self) -> float:
         """Adaptive clip threshold τ: the (1−clip_pct) quantile of recent |proj_grad|.
@@ -584,11 +615,13 @@ class ZOOptimizer:
             # window, and report how hard clipping bit this step.
             pgc, clip_frac = self._apply_grad_clip(grad_est, pg, pgc, tau)
 
-        # Update optimizer state (first-moment buffers + second moment), then step.
-        # The first moment is the EMA when momentum is on, else the raw estimate (so
-        # none+second_moment = RMSProp); _apply_update folds in the √v divide if enabled.
-        self._update_optimizer_state(grad_est, pair_seeds, pgc)
+        # Update optimizer state, then step. The first moment is the EMA when momentum is
+        # on, else the raw estimate (so none+second_moment = RMSProp). v tracks g² or, for
+        # R-AdaZO, the fresh m_t²; _apply_update folds in the √v divide if enabled.
+        self._update_first_moment(grad_est, pair_seeds, pgc)
         m_t = self._get_gradient_ema() if self.has_momentum else grad_est
+        if cfg.mom.second_moment:
+            self._update_second_moment(m_t if cfg.mom.second_moment_source == "momentum" else grad_est)
         self._apply_update(m_t, lr_t)
 
         # Aggregate metrics. "loss" is the optimization scalar (value, centered over ±eps);
