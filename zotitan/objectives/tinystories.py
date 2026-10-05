@@ -5,12 +5,12 @@ The dataset is already cached by HF in this environment, but the objective
 streams/lazy-loads it rather than downloading a snapshot up front, so
 `dataset_sources()` is empty.
 """
-import math
 import random
 
 import torch
 
 from ..data import EVAL_SAMPLES, batched
+from ..losses import ppl_metrics
 from ..objective import (CrossEntropyCriterion, RubricObjective, register_objective)
 
 
@@ -86,4 +86,4 @@ class TinyStoriesObjective(RubricObjective):
                 k = enc.input_ids.shape[1] - 1
                 total_loss += loss.item() * k
                 total_tokens += k
-        return {"ppl": math.exp(total_loss / total_tokens)}
+        return ppl_metrics(total_loss, total_tokens)

@@ -1,9 +1,9 @@
 """The C4 (causal-LM perplexity) objective (registry name "c4")."""
-import math
 import os
 import torch
 
 from ..data import EVAL_SAMPLES, batched
+from ..losses import ppl_metrics
 from ..objective import (CrossEntropyCriterion, DatasetSource, RubricObjective, register_objective)
 
 
@@ -93,4 +93,4 @@ class C4Objective(RubricObjective):
                 k = enc.input_ids.shape[1] - 1
                 total_loss += loss.item() * k
                 total_tokens += k
-        return {"ppl": math.exp(total_loss / total_tokens)}
+        return ppl_metrics(total_loss, total_tokens)

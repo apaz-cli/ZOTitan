@@ -1,7 +1,20 @@
 from functools import lru_cache
+import math
 import torch
 
 from .schedule import maybe_torchcompile
+
+
+def ppl_metrics(total_loss: float, total_tokens: int) -> dict[str, float]:
+    """Eval metrics from a summed token NLL: the mean NLL, plus perplexity when it is
+    representable. A diverged model's NLL can exceed ~709, where exp() overflows; ppl is
+    then left out rather than logged as inf, which mlsweep would serialize as non-JSON
+    `Infinity`."""
+    nll = total_loss / total_tokens
+    if nll < math.log(1e300):
+        return {"nll": nll, "ppl": math.exp(nll)}
+    print(f"  nll {nll:.4g} is too large for a finite perplexity; logging nll only")
+    return {"nll": nll}
 
 
 def get_xentropy(fused: bool, compile_mode: str | None = None):

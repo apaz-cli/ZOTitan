@@ -31,12 +31,12 @@ class BaseTrainConfig:
     """Debug: draw one batch up front and reuse it every step (loss should drive toward 0).
     A quick way to smoke out objective/optimizer bugs in isolation from the data pipeline."""
 
-    loss_kill_threshold: float = 0.0
+    loss_kill_threshold: float = 10.0
     """Early-termination threshold on the per-step loss. If `loss` stays above this
     value for `loss_kill_threshold_patience` consecutive steps, training stops
     gracefully. 0 disables."""
 
-    loss_kill_threshold_patience: int = 0
+    loss_kill_threshold_patience: int = 5
     """Consecutive steps `loss` must exceed `loss_kill_threshold` before training
     stops. Only active when both are > 0."""
 
