@@ -15,12 +15,13 @@ class ProfilingConfig:
     """Save a PyTorch profiler trace here, then exit the training loop after the
     capture. Empty disables profiling. A bare filename (no directory) is written
     to the mlsweep run dir so it is picked up as an artifact; a directory gets a
-    default `profile.json`. `.json` is appended if the path has no extension."""
+    default `profile.json`. `.json` is appended if the path has no extension. Ranks other
+    than 0 of a multi-GPU run write `<name>.rank<r>.json` beside it."""
 
 trace_saved: bool = False
 
 @contextlib.contextmanager
-def maybe_enable_profiling(cfg, *, run_dir="."):
+def maybe_enable_profiling(cfg, *, run_dir=".", rank: int = 0):
     if not cfg.path:
         yield None
         return
@@ -32,6 +33,9 @@ def maybe_enable_profiling(cfg, *, run_dir="."):
         out += ".json"
     if not os.path.dirname(out):
         out = os.path.join(run_dir, out)
+    if rank:
+        stem, ext = os.path.splitext(out)
+        out = f"{stem}.rank{rank}{ext}"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     def trace_handler(prof):

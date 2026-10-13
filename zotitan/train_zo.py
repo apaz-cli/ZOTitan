@@ -3,11 +3,15 @@ import math
 import os
 import time
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 import triton
 import triton.language as tl
 from dataclasses import dataclass, field
 from typing import Literal
 from .data import PrefetchLoader, get_batches
+from .objective import floatify, merge_metrics
+from .parallel import DATA_SEED_STRIDE, any_rank, gather_objects, sync_replicas
 from .pretty import print_config, print_zo_step
 from . import profiling
 from .profiling import ProfilingConfig, maybe_enable_profiling
@@ -187,12 +191,15 @@ class ZOConfig:
 
     batch_size: int = 40
     """Per-direction batch size B: the number of examples each (z, ±ε) pair is scored on.
-    Orthogonal to z_batch. Total samples per step are batch_size * z_batch."""
+    Orthogonal to z_batch. Total samples per step are batch_size * z_batch.
+    With data parallelism and z_batch=1, each rank scores batch_size/dp of this global batch."""
 
     z_batch: int = 1
     """Number of independent (z, batch) pairs averaged per step (Multi-z MeZO, SPSA/ES).
     The total number of samples run per step is z_batch * batch_size, but due to pytorch
-    constraints (materializing z) we cannot batch them all together."""
+    constraints (materializing z) we cannot batch them all together.
+    Data parallelism splits this global z_batch across ranks first (dp must divide it), and
+    only splits batch_size when z_batch=1."""
 
     shared_batch: bool = False
     """Score every z in a step on ONE shared batch instead of z_batch distinct batches
@@ -246,22 +253,19 @@ def zeropower_via_newtonschulz(G: torch.Tensor) -> torch.Tensor:
     return X.to(G.dtype)
 
 
-def _aggregate_metrics(dicts: list[dict]) -> dict[str, float]:
-    """Average each metric key across all collected (pair, sign) score dicts.
-    Tensors are pulled to float here — off the forward-pass critical path."""
-    total: dict[str, float] = {}
-    count: dict[str, int]   = {}
-    for d in dicts:
-        for k, v in d.items():
-            if v is None:
-                continue
-            total[k] = total.get(k, 0.0) + (v.item() if isinstance(v, torch.Tensor) else float(v))
-            count[k] = count.get(k, 0) + 1
-    return {k: total[k] / count[k] for k in total}
+def split_z_batch(cfg: ZOConfig, dp: int) -> tuple[int, int]:
+    """Calculate (local_z_batch, local_batch_size)"""
+    if cfg.z_batch > 1:
+        if cfg.z_batch % dp:
+            raise ValueError(f"dp={dp} must divide zo.z_batch={cfg.z_batch} (or set z_batch=1 to split the batch instead)")
+        return cfg.z_batch // dp, cfg.batch_size
+    if cfg.batch_size % dp:
+        raise ValueError(f"with zo.z_batch=1, dp={dp} must divide zo.batch_size={cfg.batch_size}")
+    return 1, cfg.batch_size // dp
 
 
 class ZOOptimizer:
-    def __init__(self, named_params: list, cfg: ZOConfig, score_fn, total_steps: int = 0):
+    def __init__(self, named_params: list, cfg: ZOConfig, score_fn, mesh: DeviceMesh, total_steps: int = 0):
         self.named_params   = named_params
         self.params         = [p.data for _, p in named_params]
         self.cfg            = cfg
@@ -270,6 +274,12 @@ class ZOOptimizer:
         self._total_steps   = total_steps
         self.has_momentum   = cfg.mom.momentum_method != "none"
         self._seed_ctr = 0
+
+        self.local_z_batch, self.local_batch_size = split_z_batch(cfg, mesh["dp"].size())
+        self.splits_batch = self.local_batch_size < cfg.batch_size
+        """True: dp ranks score fragments of one pair's batch. False: each scores its own pairs."""
+        self._pair_lo = 0 if self.splits_batch else mesh["dp"].get_local_rank() * self.local_z_batch
+        self._mesh    = mesh
 
         # Rolling window of recent |proj_grad| for the adaptive quantile clip threshold.
         self._pg_hist = collections.deque(maxlen=cfg.clip.window) \
@@ -313,7 +323,8 @@ class ZOOptimizer:
     def _draw_seeds(self, n: int) -> list[int]:
         """Draw n fresh seeds from a counter that is independent of the training-step
         counter (self._t). A step draws every seed it needs in one call up front, so the
-        seed→pair mapping is explicit and fully storable for seed_window reconstruction."""
+        seed→pair mapping is explicit and fully storable for seed_window reconstruction.
+        Every rank draws the same global list; rank r's own pairs are a slice of it."""
         seeds = list(range(self._seed_ctr, self._seed_ctr + n))
         self._seed_ctr += n
         return seeds
@@ -385,7 +396,11 @@ class ZOOptimizer:
 
         Returns ((pos_value, pos_metrics), (neg_value, neg_metrics)). value is the
         scalar to minimize; metrics is the score's breakdown dict (tensors kept lazy
-        so the two passes don't sync between them)."""
+        so the two passes don't sync between them).
+
+        The in-place round trip θ+εz-2εz+εz leaves floating-point residue in θ, and each dp
+        rank only round-trips its own pairs, so replicas drift apart in the low bits until
+        train_zo resyncs them at the next checkpoint."""
         def acquire() -> tuple[torch.Tensor, dict]:
             s = score_fn(model, batch)
             value = s.value if isinstance(s.value, torch.Tensor) else torch.tensor(float(s.value))
@@ -539,7 +554,21 @@ class ZOOptimizer:
             adv = [a / (std + 1e-8) for a in adv]
         return [adv[2 * j + 1] - adv[2 * j] for j in range(n // 2)]
 
+    def _exchange(self, pg_t: list, val_t: list, metric_dicts: list[dict]) -> tuple[list[float], list[float], dict]:
+        """Pull the step's scalars from gpu to python lists and share them across dp ranks,
+        the step's only communication. Returns (pg, vals, metrics) for every pair in global
+        order. Ranks scoring their own pairs concatenate; ranks scoring fragments of one
+        pair's batch average (pg is linear in vals, so its average is exact)."""
+        local    = (torch.stack(pg_t).tolist(), torch.stack(val_t).tolist(), [floatify(m) for m in metric_dicts])
+        gathered = gather_objects(local, self._mesh)
+        if self.splits_batch:
+            pg, vals = ([sum(col) / len(col) for col in zip(*(r[i] for r in gathered))] for i in (0, 1))
+        else:
+            pg, vals = ([x for r in gathered for x in r[i]] for i in (0, 1))
+        return pg, vals, merge_metrics([m for r in gathered for m in r[2]])
+
     def step(self, model, batches: list[dict]) -> dict:
+        """One ZO step; `batches` holds this rank's local_z_batch batches, one per pair."""
         self._t += 1
         cfg       = self.cfg
         z_batch   = cfg.z_batch
@@ -555,18 +584,23 @@ class ZOOptimizer:
         # Draw one seed per (z, batch) pair up front (independent of the step counter _t).
         # Stored verbatim so seed_window can later replay each pair's z with its own scalar.
         pair_seeds = self._draw_seeds(z_batch)
+        my_seeds   = pair_seeds[self._pair_lo:self._pair_lo + self.local_z_batch]
 
+        # Accumulate grad_est in the loop only when each pair's scalar is known locally. Under
+        # fitness shaping it isn't known until the whole population has been ranked, and when
+        # dp ranks split a batch it needs every rank's fragment.
+        in_loop  = not self.shaping and not self.splits_batch
         grad_est: list[torch.Tensor] | None = None
 
         # Per-pair 0-dim tensors collected without syncing; stacked once after the loop.
         val_t        = []        # score.value for each (pair, sign) — the optimization scalar
-        pg_t, pgc_t  = [], []    # proj_grad and proj_grad_clipped for each z batch
-        metric_dicts = []        # score.metrics for each (pair, sign) — averaged below for logging
+        pg_t         = []        # proj_grad for each z batch
+        metric_dicts = []        # score.metrics for each (pair, sign) — reduced below for logging
 
         for j, batch in enumerate(batches):
             # `z` here is the MeZO perturbation vector (the direction we probe) — unrelated
             # to any "z_loss" softmax-normalizer term the objective may report in metrics.
-            z = self._sample_z(pair_seeds[j])
+            z = self._sample_z(my_seeds[j])
 
             # Run the perturbed model and acquire the scalar value (+ metrics) at ±eps.
             (val_pos, m_pos), (val_neg, m_neg) = self.run_forward_passes(model, batch, z, self.score_fn)
@@ -576,10 +610,9 @@ class ZOOptimizer:
             proj_grad         = (val_pos - val_neg) / (2 * cfg.eps)
             proj_grad_clipped = proj_grad.clamp(-tau, tau) if clip_in_loop else proj_grad
 
-            # Accumulate the proj_grad contribution into the gradient estimate. Skipped under
-            # fitness shaping: the per-pair scalar isn't known until the whole population has
-            # been ranked, so grad_est is built in a second pass below (regenerating each z).
-            if not self.shaping:
+            # Accumulate the proj_grad contribution into the gradient estimate. Otherwise
+            # grad_est is built in a second pass below (regenerating each z).
+            if in_loop:
                 if z_batch == 1:
                     grad_est = list(torch._foreach_mul(z, proj_grad_clipped))
                 else:
@@ -589,28 +622,32 @@ class ZOOptimizer:
 
             # Record metrics for the batch
             val_t.append(val_pos); val_t.append(val_neg)
-            pg_t.append(proj_grad); pgc_t.append(proj_grad_clipped)
+            pg_t.append(proj_grad)
             metric_dicts.append(m_pos); metric_dicts.append(m_neg)
 
-        # Pull metrics from gpu to python lists
-        pg:   list[float] = torch.stack(pg_t).tolist()
-        vals: list[float] = torch.stack(val_t).tolist()
-        mean_loss: float  = sum(vals) / len(vals)
+        # Pull metrics from gpu to python lists, for every pair on every dp rank
+        pg, vals, score_metrics = self._exchange(pg_t, val_t, metric_dicts)
+        mean_loss: float        = sum(vals) / len(vals)
 
         if self.shaping:
-            # ES/GRPO path: transform the whole population's fitness, then build grad_est by
-            # regenerating each zⱼ from its seed and weighting by its shaped scalar (the z's
-            # themselves were not kept — too large to hold a full population at once). pgc carries
-            # the shaped scalars so seed_window replay reconstructs the same gradient; clipping is off.
+            # ES/GRPO path: transform the whole population's fitness. pgc carries the shaped
+            # scalars so seed_window replay reconstructs the same gradient; clipping is off.
             pgc       = (self._grpo_advantages(vals) if cfg.fitness.strategy == "grpo"
                          else self._shape_fitness(vals))
-            grad_est  = [torch.zeros_like(p) for _, p in self.named_params]
-            for j, seed in enumerate(pair_seeds):
-                torch._foreach_add_(grad_est, self._sample_z(seed), alpha=pgc[j] / z_batch)
             clip_frac = 0.0
         else:
-            pgc = torch.stack(pgc_t).tolist()
-            assert grad_est is not None
+            pgc = [max(-tau, min(tau, g)) for g in pg] if clip_in_loop else pg
+
+        # Second pass: add every pair the loop didn't, regenerating each zⱼ from its seed and
+        # weighting by its scalar (the z's themselves were not kept — too large to hold a full
+        # population at once). That's the other dp ranks' pairs, or all of them if not in_loop.
+        if grad_est is None:
+            grad_est = [torch.zeros_like(p) for _, p in self.named_params]
+        for j, seed in enumerate(pair_seeds):
+            if not (in_loop and seed in my_seeds):
+                torch._foreach_add_(grad_est, self._sample_z(seed), alpha=pgc[j] / z_batch)
+
+        if not self.shaping:
             # Apply norm-strategy scaling (no-op for per_pair/none), record the lagged history
             # window, and report how hard clipping bit this step.
             pgc, clip_frac = self._apply_grad_clip(grad_est, pg, pgc, tau)
@@ -626,7 +663,7 @@ class ZOOptimizer:
 
         # Aggregate metrics. "loss" is the optimization scalar (value, centered over ±eps);
         # the per-criterion breakdown (ce, z_loss, acc, … or name-prefixed for a mixture)
-        # is averaged across all (pair, sign) score dicts.
+        # is reduced across all (pair, sign) score dicts on all dp ranks.
         metrics = {
             "loss":              mean_loss,
             "proj_grad":         sum(pg)  / z_batch,
@@ -635,12 +672,13 @@ class ZOOptimizer:
             "clip_tau":          tau if math.isfinite(tau) else None,
             "lr":                lr,
             **({"fit_rms": (sum(s * s for s in pgc) / z_batch) ** 0.5} if self.shaping else {}),
-            **_aggregate_metrics(metric_dicts),
+            **score_metrics,
         }
         return metrics
 
 
-def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfig | None = None, objective=None, profiling_cfg: ProfilingConfig | None = None):
+def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfig | None = None, objective=None, profiling_cfg: ProfilingConfig | None = None,
+             *, mesh: DeviceMesh):
     """
     Zeroth-order training loop. Perturbs only params with requires_grad=True.
     If merge_fn is provided, calls merge_fn(model) after each step.
@@ -652,38 +690,44 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
         from objective import make_objective
         objective = make_objective("scijudge")
 
+    sync_replicas(model.state_dict().values(), mesh)
     named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     n_params     = sum(p.numel() for _, p in named_params)
     device       = next(model.parameters()).device
     move_fn      = None if getattr(objective, "flat_batches", True) else objective.to_device
-    loader       = PrefetchLoader(objective.train_batches(tokenizer, seed, cfg.batch_size), device, move_fn=move_fn)
     run_dir      = os.environ.get("MLSWEEP_RUN_DIR", ".")
+    overfit      = cfg.base.overfit_first_batch
 
-    opt = ZOOptimizer(named_params, cfg, objective.score, total_steps=total_steps)
+    opt = ZOOptimizer(named_params, cfg, objective.score, mesh, total_steps=total_steps)
+    # Ranks scoring their own pairs on a shared batch must all read the same stream;
+    # otherwise each dp rank loads its own fragment.
+    dp_rank      = 0 if (cfg.shared_batch or overfit) and not opt.splits_batch else mesh["dp"].get_local_rank()
+    loader       = PrefetchLoader(objective.train_batches(tokenizer, seed + DATA_SEED_STRIDE * dp_rank,
+                                                          opt.local_batch_size), device, move_fn=move_fn)
     print_config(cfg)
 
     print(f"  ZO train: {total_steps:,} steps | {n_params:,} params")
+    print(f"  dp={mesh['dp'].size()} | per rank: z_batch={opt.local_z_batch} batch_size={opt.local_batch_size}")
     model.eval()
     show_lr    = not wsd_is_constant(cfg.base.lr_wsd)
-    overfit    = cfg.base.overfit_first_batch
     if overfit:
         print("  overfit: reusing the first batch every step")
     fixed_batches = None
 
     kill_guard = LossKillGuard(cfg.base)
 
-    with maybe_enable_profiling(profiling_cfg or ProfilingConfig(), run_dir=run_dir) as torch_profiler:
+    with maybe_enable_profiling(profiling_cfg or ProfilingConfig(), run_dir=run_dir, rank=dist.get_rank()) as torch_profiler:
         for step in range(total_steps):
             if fixed_batches is not None:
                 batches = fixed_batches
             elif cfg.shared_batch or overfit:
                 # For ES/GRPO Fitness Shaping. Scores the whole z-population on one batch.
                 one = get_batches(loader, 1)
-                batches = one * cfg.z_batch if one is not None else None
+                batches = one * opt.local_z_batch if one is not None else None
             else:
                 # For MeZO/SPSA
-                batches = get_batches(loader, cfg.z_batch)
-            if batches is None:
+                batches = get_batches(loader, opt.local_z_batch)
+            if any_rank(batches is None, mesh):                   # any rank ran dry → all stop
                 print("Dataloader exhausted, ending training.")
                 break
             if overfit:
@@ -708,7 +752,9 @@ def train_zo(model, tokenizer, total_steps, seed, merge_fn, logger, cfg: ZOConfi
                     break
 
             if (step + 1) % cfg.base.ckpt_every == 0:
-                save_merged_checkpoint(model, tokenizer, run_dir)
+                sync_replicas(opt.params, mesh)   # undo the replicas' round-trip drift
+                if dist.get_rank() == 0:
+                    save_merged_checkpoint(model, tokenizer, run_dir)
                 logger.sync()
 
     return model

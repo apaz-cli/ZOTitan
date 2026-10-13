@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 
 # mlsweep worker sets CUDA_VISIBLE_DEVICES, MLSWEEP_RUN_DIR, MLSWEEP_WORKER_SOCKET
+# (and RANK / WORLD_SIZE / LOCAL_RANK / MASTER_* for multi-GPU sweeps with SET_DIST_ENV)
+import os
+import sys
 import tyro
 import torch
+import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import Literal
 from mlsweep.logger import MLSweepLogger
@@ -12,6 +16,7 @@ from .lora  import make_lora, merge_and_unload, merge_and_zero_lora, print_train
 from .train_fo import train_fo, FOConfig
 from .train_zo import train_zo, ZOConfig
 from .objective import build_objective, parse_objective_spec, prepare_datasets
+from .parallel import ParallelConfig, init_mesh
 from .profiling import ProfilingConfig
 from .pretty import print_eval_results, BANNER
 
@@ -91,6 +96,9 @@ class ExperimentConfig:
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     """PyTorch profiler (chrome trace / Perfetto)."""
 
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
+    """Data parallelism. Multi-GPU runs launch via torchrun or mlsweep."""
+
 def _compile_args(compile_mode: str, cudagraphs: bool) -> tuple[bool, str | None]:
     """Map user-facing knobs to (enabled, torch_compile_mode)."""
     compile_mode = compile_mode.replace("_", "-")
@@ -103,6 +111,7 @@ def _compile_args(compile_mode: str, cudagraphs: bool) -> tuple[bool, str | None
     raise AssertionError(f"unreachable compile_mode: {compile_mode!r}")
 
 def _run(cfg: ExperimentConfig, logger: MLSweepLogger):
+    mesh          = init_mesh(cfg.parallel)
     tc            = cfg.training
     lora_cfg      = cfg.lora
     compile_enabled, compile_mode = _compile_args(tc.compile_mode, tc.compile_cudagraphs)
@@ -117,14 +126,14 @@ def _run(cfg: ExperimentConfig, logger: MLSweepLogger):
     if optimizer == "fo" and not objective.differentiable:
         raise ValueError(f"FO requires a differentiable objective; {objective.name} is not.")
 
-    def _train(model, tokenizer, steps, seed=0, merge_fn=None):            
+    def _train(model, tokenizer, steps, seed=0, merge_fn=None):
         if optimizer == "fo":
             return train_fo(model, tokenizer, steps, seed=seed, merge_fn=merge_fn,
-                            logger=logger, cfg=cfg.fo, objective=objective,
+                            logger=logger, cfg=cfg.fo, objective=objective, mesh=mesh,
                             profiling_cfg=cfg.profiling)
-        else:
+        else: # optimizer == "zo"
             return train_zo(model, tokenizer, steps, seed=seed, merge_fn=merge_fn,
-                            logger=logger, cfg=cfg.zo, objective=objective,
+                            logger=logger, cfg=cfg.zo, objective=objective, mesh=mesh,
                             profiling_cfg=cfg.profiling)
 
     model, tokenizer = load_model(cfg.model)
@@ -160,7 +169,7 @@ def _run(cfg: ExperimentConfig, logger: MLSweepLogger):
     else:
         raise AssertionError(f"unreachable lora_strategy: {lora_strategy!r}")
 
-    if tc.eval:
+    if tc.eval and dist.get_rank() == 0:          # replicas agree, so rank 0 evals for all
         results = objective.evaluate(model, tokenizer)
         logger.log(results)
         print_eval_results(results)
@@ -173,7 +182,9 @@ def run(cfg: ExperimentConfig, logger: MLSweepLogger):
 
 def main():
     cfg = tyro.cli(ExperimentConfig, description=BANNER)
-    with MLSweepLogger() as logger:
+    if int(os.environ.get("RANK", "0")) != 0:
+        sys.stdout = open(os.devnull, "w")   # rank 0 prints for everyone (mlsweep already does this; torchrun doesn't)
+    with MLSweepLogger() as logger:          # logs from rank 0 only (MLSWEEP_GPU_RANK)
         run(cfg, logger)
 
 

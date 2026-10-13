@@ -47,7 +47,7 @@ def load_model(cfg: ModelConfig):
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_id,
             dtype=torch.bfloat16,
-            device_map="cuda",
+            device_map=f"cuda:{torch.cuda.current_device()}",   # plain "cuda" means cuda:0
             attn_implementation=cfg.attn_impl,
         )
     else:

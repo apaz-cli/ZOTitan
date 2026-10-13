@@ -30,8 +30,9 @@ from typing import Any, Callable, Iterator, Protocol
 
 # ── score / criterion contracts ────────────────────────────────────────────────
 
-# value may be a 0-dim tensor
-Metric = torch.Tensor | float
+# value may be a 0-dim tensor. A bare value is averaged when steps or ranks are merged;
+# tag it as (value, op) to reduce with another op from REDUCE instead.
+Metric = torch.Tensor | float | tuple[torch.Tensor | float, str]
 
 @dataclass
 class Score:
@@ -39,14 +40,32 @@ class Score:
     metrics: dict[str, Metric]           # everything to log (components of `value`, aux)
 
 
-def floatify(metrics: dict[str, Metric]) -> dict[str, float]:
-    """Collapse a metrics dict to plain floats (one .item() per tensor)."""
-    out: dict[str, float] = {}
+REDUCE: dict[str, Callable[[list[float]], float]] = {
+    "mean": lambda xs: sum(xs) / len(xs), "sum": sum, "max": max, "min": min,
+}
+
+
+def floatify(metrics: dict[str, Metric]) -> dict[str, tuple[float, str]]:
+    """Collapse a metrics dict to (float, op) pairs (one .item() per tensor)."""
+    out: dict[str, tuple[float, str]] = {}
     for k, v in metrics.items():
+        v, op = v if isinstance(v, tuple) else (v, "mean")
         if v is None:
             continue
-        out[k] = v.item() if isinstance(v, torch.Tensor) else float(v)
+        out[k] = (v.item() if isinstance(v, torch.Tensor) else float(v), op)
     return out
+
+
+def merge_metrics(dicts: list[dict[str, tuple[float, str]]]) -> dict[str, float]:
+    """Reduce each key over the floatified dicts that carry it (a mixture's steps, or
+    ranks, may report different keys), with the key's op."""
+    vals: dict[str, list[float]] = {}
+    ops:  dict[str, str]         = {}
+    for d in dicts:
+        for k, (v, op) in d.items():
+            vals.setdefault(k, []).append(v)
+            ops[k] = op
+    return {k: REDUCE[ops[k]](vs) for k, vs in vals.items()}
 
 
 class Criterion(Protocol):

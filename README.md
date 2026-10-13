@@ -69,6 +69,11 @@ returns is differentiable, you can just do:
 ./train.py --optimizer fo  # Adam (with gradients)
 ```
 
+### Multi-GPU (data parallel)
+
+Launch with `mlsweep` with `GPUS_PER_RUN = dp` and `SET_DIST_ENV = True` in the sweep
+file, and set `--parallel.dp`.
+
 ### Objectives
 
 The `--objective` flag takes a `+`-joined mixture spec. Each component selects a
