@@ -264,6 +264,11 @@ def split_z_batch(cfg: ZOConfig, dp: int) -> tuple[int, int]:
     return 1, cfg.batch_size // dp
 
 
+# Mixes a pair's z seed into its forward-pass seed, so the model's own RNG stream (the
+# default torch generator) doesn't line up with the philox streams that generate z.
+_FWD_SEED_MULT = 0x9E3779B97F4A7C15
+
+
 class ZOOptimizer:
     def __init__(self, named_params: list, cfg: ZOConfig, score_fn, mesh: DeviceMesh, total_steps: int = 0):
         self.named_params   = named_params
@@ -390,18 +395,25 @@ class ZOOptimizer:
     def _apply_z(self, z: list, scale: float):
         torch._foreach_add_(self.params, z, alpha=scale)
 
-    def run_forward_passes(self, model, batch, z: list, score_fn) -> tuple[tuple[torch.Tensor, dict],
-                                                                           tuple[torch.Tensor, dict]]:
+    def run_forward_passes(self, model, batch, z: list, score_fn, fwd_seed: int) -> tuple[tuple[torch.Tensor, dict],
+                                                                                          tuple[torch.Tensor, dict]]:
         """Run the two perturbed forward passes (0-dim tensors, no device sync).
 
         Returns ((pos_value, pos_metrics), (neg_value, neg_metrics)). value is the
         scalar to minimize; metrics is the score's breakdown dict (tensors kept lazy
         so the two passes don't sync between them).
 
+        The default torch generator is reseeded with `fwd_seed` before each pass, so a
+        stochastic forward (sampled routing, noisy memory, ...) draws identical noise at
+        +εz and -εz and the antithetic difference cancels it, leaving only the effect of
+        the perturbation. It is a host-side seed/offset reset (no sync, no kernel), and
+        it sits outside the compiled score_fn so it causes no graph break.
+
         The in-place round trip θ+εz-2εz+εz leaves floating-point residue in θ, and each dp
         rank only round-trips its own pairs, so replicas drift apart in the low bits until
         train_zo resyncs them at the next checkpoint."""
         def acquire() -> tuple[torch.Tensor, dict]:
+            torch.manual_seed(fwd_seed)
             s = score_fn(model, batch)
             value = s.value if isinstance(s.value, torch.Tensor) else torch.tensor(float(s.value))
             return value, s.metrics
@@ -603,7 +615,8 @@ class ZOOptimizer:
             z = self._sample_z(my_seeds[j])
 
             # Run the perturbed model and acquire the scalar value (+ metrics) at ±eps.
-            (val_pos, m_pos), (val_neg, m_neg) = self.run_forward_passes(model, batch, z, self.score_fn)
+            (val_pos, m_pos), (val_neg, m_neg) = self.run_forward_passes(
+                model, batch, z, self.score_fn, fwd_seed=(my_seeds[j] * _FWD_SEED_MULT) & 0x7FFFFFFFFFFFFFFF)
 
             # Calculate the projected grad in the direction of z. per_pair clamps here;
             # norm/none accumulate the raw scalar and (for norm) rescale grad_est later.

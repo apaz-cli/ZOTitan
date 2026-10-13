@@ -8,7 +8,8 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B-Base"
 @dataclass
 class ModelConfig:
     model_id: str = DEFAULT_MODEL_ID
-    """HuggingFace model ID."""
+    """HuggingFace model ID, or a local arch spec such as `gru` or
+    `(transformer,d_model=512,n_layers=8)` (see arch.py; random init, pretrained is ignored)."""
 
     pretrained: bool = True
     """True: load pretrained weights (finetuning). False: random init (pretraining from scratch)."""
@@ -22,22 +23,15 @@ class ModelConfig:
     model's usable context; the single source of truth, threaded into each objective at
     build time (objectives never reach for a global)."""
 
-    hidden: int | None = None
-    """Override the GRU hidden size for tiny models (width scaling). None = arch default."""
-
-    num_layers: int | None = None
-    """Override the GRU layer count for tiny models (depth scaling). None = arch default."""
-
 
 def load_model(cfg: ModelConfig):
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-    # Local (non-HF) toy models built in pure torch: selecting one as model_id builds
-    # it from tiny_model.py instead of downloading pretrained weights. TINY_ARCHS is
-    # the only list of which ids exist — don't mirror it here, or the two drift.
-    from .tiny_model import TINY_ARCHS, build_tiny
-    if cfg.model_id in TINY_ARCHS:
-        model, tokenizer = build_tiny(cfg.model_id, hidden=cfg.hidden, num_layers=cfg.num_layers)
+    # Local pure-torch archs (arch.py's registry) build from scratch instead of
+    # downloading. ARCHS is the only list of which ids exist — don't mirror it here.
+    from .arch import build_arch, is_arch_spec
+    if is_arch_spec(cfg.model_id):
+        model, tokenizer = build_arch(cfg.model_id)
         return model.to(dtype=torch.bfloat16).cuda(), tokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)

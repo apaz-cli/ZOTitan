@@ -16,7 +16,6 @@ COMMAND = [
     "python", "train.py",
     "--optimizer", "zo",
     "--objective", "tinystories",
-    "--model.model-id", "zotitan/tinystories-byte-rnn",
     "--model.max-seq-len", "256",
     "--training.steps", "1000",
     "--training.no-eval",
@@ -36,10 +35,10 @@ EXTRA_FLAGS = ["--zo.batch-size", "16", "--zo.z-batch", "16", "--zo.eps", "0.001
 OPTIONS = {
     ".width": {
         "flags": {
-            "25m":  ["--model.hidden", "1632"],
-            "50m":  ["--model.hidden", "2304"],
-            "75m":  ["--model.hidden", "2848"],
-            "100m": ["--model.hidden", "3296"],
+            "25m":  ["--model.model-id", "(zotitan/tinystories-byte-rnn,hidden=1632)"],
+            "50m":  ["--model.model-id", "(zotitan/tinystories-byte-rnn,hidden=2304)"],
+            "75m":  ["--model.model-id", "(zotitan/tinystories-byte-rnn,hidden=2848)"],
+            "100m": ["--model.model-id", "(zotitan/tinystories-byte-rnn,hidden=3296)"],
         },
         "name": "w",
     },

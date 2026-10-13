@@ -25,7 +25,9 @@ import time
 import torch
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Protocol
+from typing import Callable, Iterator, Protocol
+
+from .spec import parse_component, parse_value, split_top_level
 
 
 # ── score / criterion contracts ────────────────────────────────────────────────
@@ -101,10 +103,17 @@ class CrossEntropyCriterion:
         self.z_loss_weight    = z_loss_weight
         self.fused            = fused
         self.compute_accuracy = compute_accuracy
-        self.fn               = get_xentropy(fused=self.fused, compile_mode=self.compile_mode)
+        self.fn               = get_xentropy(fused=self.fused, compile_enabled=self.compile_enabled,
+                                              compile_mode=self.compile_mode)
 
     def __call__(self, model, batch):
         loss, z_loss, extra = self.fn(model, batch, self.z_loss_weight, self.compute_accuracy) # type: ignore
+        if self.compile_enabled and not self.fused:
+            # Clone before the next call: under cudagraphs the ZO loop holds the + pass's
+            # outputs (lazily, no sync) while the - pass replays over the same buffers.
+            loss   = loss.clone()
+            z_loss = z_loss.clone() if z_loss is not None else None
+            extra  = {k: v.clone() for k, v in extra.items()} if extra else extra
         value = loss if z_loss is None else loss + z_loss
         metrics: dict[str, Metric] = {"ce": loss}
         if z_loss is not None:
@@ -358,81 +367,6 @@ class ObjectiveConfig:
     kwargs:      dict = field(default_factory=dict)   # extra per-objective config from the spec
 
 
-_QUOTES = ("'", '"')
-
-
-def _split_top_level(s: str, delim: str) -> list[str]:
-    """Split `s` on `delim`, ignoring delimiters inside quoted regions (either ' or ")
-    or parentheses. A doubled quote inside a quote ('' or "") is a literal quote, not a
-    terminator."""
-    out: list[str] = []
-    buf: list[str] = []
-    quote: str | None = None      # the open quote char, or None when unquoted
-    depth = 0
-    i = 0
-    while i < len(s):
-        c = s[i]
-        if quote is not None:
-            if c == quote and i + 1 < len(s) and s[i + 1] == quote:
-                buf.append(c); buf.append(c); i += 2; continue   # escaped quote, stay in-quote
-            if c == quote:
-                quote = None
-        elif c in _QUOTES:
-            quote = c
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-        elif c == delim and depth == 0:
-            out.append("".join(buf)); buf = []; i += 1; continue
-        buf.append(c)
-        i += 1
-    if quote is not None:
-        raise ValueError(f"unterminated {quote} quote in objective spec: {s!r}")
-    out.append("".join(buf))
-    return out
-
-
-def _parse_value(tok: str) -> Any:
-    """Parse a single field value. Quoted (' or ") -> string (a doubled quote -> a literal
-    quote); otherwise it must be a bare literal (int / float / True / False / None)."""
-    tok = tok.strip()
-    if tok and tok[0] in _QUOTES:
-        q = tok[0]
-        if len(tok) < 2 or tok[-1] != q:
-            raise ValueError(f"malformed quoted value in objective spec: {tok!r}")
-        return tok[1:-1].replace(q + q, q)
-    low = tok.lower()
-    if low in ("true", "false"):
-        return low == "true"
-    if low in ("none", "null"):
-        return None
-    try:
-        return int(tok)
-    except ValueError:
-        pass
-    try:
-        return float(tok)
-    except ValueError:
-        raise ValueError(
-            f"unquoted value {tok!r} is not a number/bool/None — wrap strings in "
-            f"quotes, e.g. key='some/string'")
-
-
-def _split_kv(field: str) -> tuple[str | None, str]:
-    """Return (key, value) if the field has a top-level '=', else (None, field)."""
-    quote: str | None = None
-    for i, c in enumerate(field):
-        if quote is not None:
-            if c == quote:
-                quote = None
-        elif c in _QUOTES:
-            quote = c
-        elif c == "=":
-            return field[:i], field[i + 1:]
-    return None, field
-
-
 def parse_objective_spec(spec: str) -> list[ObjectiveConfig]:
     """Parse a mixture spec into a list of ObjectiveConfig.
 
@@ -442,37 +376,16 @@ def parse_objective_spec(spec: str) -> list[ObjectiveConfig]:
     bool/None literals and strings are single-quoted.
     """
     objs: list[ObjectiveConfig] = []
-    for raw in _split_top_level(spec, "+"):
+    for raw in split_top_level(spec, "+"):
         part = raw.strip()
         if not part:
             raise ValueError(f"empty component in objective spec: {spec!r}")
-
-        if part.startswith("(") and part.endswith(")"):
-            fields = [f.strip() for f in _split_top_level(part[1:-1], ",")]
-        else:
-            fields = [part]
-
-        name = fields[0]
-        if not name or _split_kv(name)[0] is not None:
-            raise ValueError(f"missing dataset name in objective component: {part!r}")
-
-        weights: list[float] = []
-        kwargs: dict = {}
-        for f in fields[1:]:
-            key, val = _split_kv(f)
-            if key is None:                       # positional weight
-                if kwargs:
-                    raise ValueError(
-                        f"positional weight after keyword field in {part!r} "
-                        f"(weights must come before KEY=VALUE)")
-                weights.append(float(_parse_value(f)))
-            else:
-                kwargs[key.strip()] = _parse_value(val)
-
-        if len(weights) > 2:
+        name, positional, kwargs = parse_component(part)
+        if len(positional) > 2:
             raise ValueError(
                 f"too many positional fields in objective component {part!r} "
                 f"(expected NAME[,loss_weight[,data_weight]])")
+        weights = [float(parse_value(f)) for f in positional]
         lw = weights[0] if len(weights) >= 1 else 1.0
         dw = weights[1] if len(weights) == 2 else 1.0
         objs.append(ObjectiveConfig(dataset=name, loss_weight=lw,

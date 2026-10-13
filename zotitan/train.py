@@ -12,6 +12,7 @@ from typing import Literal
 from mlsweep.logger import MLSweepLogger
 
 from .model import load_model, ModelConfig
+from .arch import print_param_report
 from .lora  import make_lora, merge_and_unload, merge_and_zero_lora, print_trainable_params, LoRAConfig
 from .train_fo import train_fo, FOConfig
 from .train_zo import train_zo, ZOConfig
@@ -137,6 +138,7 @@ def _run(cfg: ExperimentConfig, logger: MLSweepLogger):
                             profiling_cfg=cfg.profiling)
 
     model, tokenizer = load_model(cfg.model)
+    print_param_report(model)
 
     if lora_strategy == "none":
         print(f"[{label}] {tc.steps:,} steps (full finetune)")

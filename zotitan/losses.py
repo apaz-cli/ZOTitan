@@ -17,14 +17,14 @@ def ppl_metrics(total_loss: float, total_tokens: int) -> dict[str, float]:
     return {"nll": nll}
 
 
-def get_xentropy(fused: bool, compile_mode: str | None = None):
+def get_xentropy(fused: bool, compile_enabled: bool = False, compile_mode: str | None = None):
     """Cross-entropy (+ optional z_loss and token accuracy) over the model's LM head,
     returning (loss, z_loss, extra). Selects the fused Liger kernel or the reference
     torch path; the heavy Liger import only happens on the fused path, so eval-only
     callers that never score never pull it in."""
     if fused:
         return _liger_xentropy  # never compiled: graph-breaks
-    return _compiled_torch_xentropy(compile_mode)
+    return _compiled_torch_xentropy(compile_enabled, compile_mode)
 
 
 def _liger_xentropy(model, batch, z_loss_weight: float, compute_accuracy: bool):
@@ -39,6 +39,7 @@ def _liger_xentropy(model, batch, z_loss_weight: float, compute_accuracy: bool):
         lse_square_scale=z_loss_weight,   # λ on mean(logsumexp(logits)²), same as the torch path
         return_z_loss=has_z,
         return_token_accuracy=compute_accuracy,
+        softcap=getattr(getattr(model, "_orig_mod", model), "logit_softcap", None),
     )
     m       = getattr(model, "_orig_mod", model)
     hidden  = m.get_decoder()(
@@ -93,8 +94,8 @@ def _torch_xentropy(model, batch, z_loss_weight: float, compute_accuracy: bool):
 
 
 @lru_cache(maxsize=None)
-def _compiled_torch_xentropy(compile_mode: str | None):
+def _compiled_torch_xentropy(compile_enabled: bool, compile_mode: str | None):
     """The reference path, compiled once per (enabled, mode). torch.compile must reuse
     one artifact — rebuilding it per step would re-trace and defeat compilation — so
     the build-once cache lives here in the kernel module, not on the criterion."""
-    return maybe_torchcompile(_torch_xentropy, enabled=(compile_mode is None), mode=compile_mode)
+    return maybe_torchcompile(_torch_xentropy, enabled=compile_enabled, mode=compile_mode)

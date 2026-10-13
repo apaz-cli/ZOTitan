@@ -74,6 +74,31 @@ returns is differentiable, you can just do:
 Launch with `mlsweep` with `GPUS_PER_RUN = dp` and `SET_DIST_ENV = True` in the sweep
 file, and set `--parallel.dp`.
 
+### Architectures
+
+`--model.model-id` takes a HuggingFace id or a local arch spec, in the same grammar as
+objectives (KEY=VALUE fields only). Local archs are pure torch and train from scratch:
+
+```bash
+./train.py --model.model-id gru                                  # stacked GRU
+./train.py --model.model-id "(transformer,d_model=512,n_layers=8)"
+./train.py --model.model-id "(zotitan/tinystories-byte-rnn,num_layers=3)"  # preset + override
+./train.py --model.model-id hardroute                            # non-differentiable example
+./train.py --model.model-id noise_gpt --objective noise --zo.shared-batch --zo.batch-size 8
+```
+
+The last line is the [Noise](https://github.com/qlabs-eng/noise) backprop-free pretraining
+benchmark: their fixed 37.7M GPT, BPE-4096 FineWeb data (built and hash-checked on first
+use), one epoch, scored as `val_loss` on their validation set. Checkpoints load strictly
+into their `utils/eval.py`.
+
+`tokenizer='byte'` (default) or `tokenizer='qwen'` picks the vocab. To add one, subclass
+`ZOLM` in a new file under `zotitan/archs/` and decorate it with `@register_arch("name")`;
+see `zotitan/archs/hardroute.py` for a template. Nothing has to be differentiable. A
+stochastic forward should draw from the default torch generator: the ZO loop reseeds it
+per perturbation pair, so the +εz and -εz passes see the same noise and it cancels. Each
+run prints its body/embed/head param split; compare archs at matched body size.
+
 ### Objectives
 
 The `--objective` flag takes a `+`-joined mixture spec. Each component selects a

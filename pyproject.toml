@@ -31,5 +31,8 @@ zotitan_eval = "zotitan.eval:main"
 [tool.setuptools.packages.find]
 include = ["zotitan*"]
 
+[tool.setuptools.package-data]
+zotitan = ["assets/*.json"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
